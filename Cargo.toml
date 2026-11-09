@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+# aicraft-ui 刻意不放进 workspace。
+#
+# 原因：workspace 的依赖解析是全局的，只要有一个成员引用 eframe，
+# `cargo build -p aicraft-core --offline` 也会因为找不到 eframe 而失败。
+# 把 UI 拆出去之后，core 与 cli 保持「零依赖、离线可构建」这一性质 ——
+# 这是本项目最重要的工程约束，不该为了目录整齐而牺牲。
+members = ["crates/aicraft-core", "crates/aicraft-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

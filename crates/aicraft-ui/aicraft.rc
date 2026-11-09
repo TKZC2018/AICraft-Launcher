@@ -1,0 +1,42 @@
+// AICraft Launcher 的 Windows 资源：图标 + 版本信息。
+// 由 build.rs 用 SDK 的 rc.exe 编译后交给链接器；非 Windows 构建会跳过这个文件。
+//
+// 这里刻意不 #include <winver.h>：build.rs 直接调 rc.exe，不走 VS 的
+// 开发人员命令提示符，环境里没有 SDK 的 INCLUDE 搜索路径，一 include 就报
+// RC1015。VERSIONINFO 是 rc.exe 的内建语句，下面这些常量就用它们的字面值，
+// 括号里注明原本的符号名。
+
+// 1 号图标是 exe / 任务栏 / 资源管理器显示的那一枚（多尺寸 ico）。
+1 ICON "assets/icon.ico"
+
+// 版本资源的名字必须是数字 1（RT_VERSION 的传统 ID）。写成 `VS_VERSION_INFO
+// VERSIONINFO` 也能编译，但 rc.exe 会把名字保留成字符串，而 Windows 的
+// GetFileVersionInfo 只按 ID 1 查找——结果就是「属性 → 详细信息」一片空白。
+1 VERSIONINFO
+  FILEVERSION     0, 1, 0, 0
+  PRODUCTVERSION  0, 1, 0, 0
+  FILEFLAGSMASK   0x3fL   // VS_FFI_FILEFLAGSMASK
+  FILEFLAGS       0       // 调试位、预发布位都不设
+  FILEOS          0x40004L // VOS_NT_WINDOWS32
+  FILETYPE        0x1     // VFT_APP
+  FILESUBTYPE     0x0     // VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0x0804 = 简体中文，0x04B0 = 1200 = Unicode 代码页
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName",      "AICraft"
+            VALUE "FileDescription",  "AICraft Launcher"
+            VALUE "FileVersion",      "0.1.0"
+            VALUE "InternalName",     "AICraftLauncher"
+            VALUE "OriginalFilename", "AICraftLauncher.exe"
+            VALUE "ProductName",      "AICraft Launcher"
+            VALUE "ProductVersion",   "0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

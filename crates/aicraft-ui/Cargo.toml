@@ -1,0 +1,60 @@
+[workspace]
+
+[package]
+name = "aicraft-ui"
+version = "0.1.0"
+edition = "2021"
+# 跟 core 不一样：eframe / egui 0.37 自己就要求 1.95，写低了解析依赖时
+# cargo 会直接拒绝构建。core 与 cli 仍然是 1.75（它们零外部依赖）。
+rust-version = "1.95"
+license = "MIT"
+description = "AICraft Launcher 的图形界面（egui + eframe）"
+
+[[bin]]
+# 面向用户的可执行文件名。启动器全名是 "AICraft Launcher"，
+# 但文件名不能带空格，所以用驼峰拼写。
+name = "AICraftLauncher"
+path = "src/main.rs"
+
+[dependencies]
+# core 用路径依赖；它本身零依赖，不会引入额外下载。
+aicraft-core = { path = "../aicraft-core" }
+
+# egui 走 glow 后端（OpenGL）：比 wgpu 依赖少、体积小、启动快。
+# 关掉默认特性就是为了不带 wgpu —— 对启动器而言它只有成本没有收益。
+#
+# **不开 `default_fonts`**：它会往 exe 里塞四个跨平台的演示字体（约 1.42 MB），
+# 而界面本来就自己从系统读中文字体。字体链改由 `install_fonts()` 手工搭
+# （见 main.rs）：正文取微软雅黑、等宽取 Consolas、符号取 seguisym。
+eframe = { version = "0.37", default-features = false, features = ["glow"] }
+# 同理：`monochrome_emoji_fonts` 会连带 `default_fonts`，
+# emoji 改由系统的 `seguisym.ttf` 兜底（实测覆盖 U+1F50D）。
+egui = { version = "0.37", default-features = false }
+
+# 模组图标：Modrinth 的 CDN 大多给 webp（无损 VP8L 为主，也有 jpeg/png）。
+# 只开 webp + png + jpeg 三个解码器，其余格式用不上，开了只会让 exe 变大。
+image = { version = "0.25", default-features = false, features = [
+    "webp",
+    "png",
+    "jpeg",
+] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# UI 是独立 workspace（顶部有 [workspace]），读不到根 Cargo.toml 的
+# [profile.release]。这里把根目录那套体积优先的参数再声明一遍，否则
+# UI 一直用默认 release（opt-level=3 速度优先、lto=false、panic=unwind、
+# strip=debuginfo），exe 会比该有的大一截。
+#
+# opt-level="z"  只求体积；启动器对启动速度不敏感。
+# lto=true       跨 crate 内联，能砍掉不少 egui/eframe 的重复代码。
+# codegen-units=1 给 LTO 最大的优化空间（代价是编译变慢）。
+# panic="abort"  去掉 unwinding 表。
+# strip=true     连符号表一起剥掉。
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

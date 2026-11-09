@@ -1,0 +1,17 @@
+[package]
+name = "aicraft-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "aicraft 的命令行入口，用于在没有 UI 的情况下验证 core 行为"
+
+[[bin]]
+name = "aicraft"
+path = "src/main.rs"
+
+[dependencies]
+aicraft-core = { path = "../aicraft-core" }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,14 @@
+[package]
+name = "aicraft-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MCJE launcher core: version manifest parsing, rule evaluation, classpath and launch command assembly"
+
+# 刻意保持零依赖：本机 cargo 无法访问 crates.io（schannel 凭证问题），
+# 且启动器 core 只需要 serde 级别的 JSON 解析，自带一个最小解析器即可。
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
