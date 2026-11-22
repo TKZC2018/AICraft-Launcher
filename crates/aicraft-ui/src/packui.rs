@@ -169,7 +169,7 @@ pub fn drop_overlay(ctx: &egui::Context) {
     painter.rect_stroke(
         frame,
         14.0,
-        egui::Stroke::new(2.0, theme::ACCENT),
+        egui::Stroke::new(2.0, theme::accent_fill()),
         egui::StrokeKind::Inside,
     );
 
@@ -327,11 +327,12 @@ pub fn modal(
                             .size(11.5)
                             .color(theme::TEXT_WEAK),
                     );
-                    let edit = ui.add(
+                    let mut edit = ui.add(
                         egui::TextEdit::singleline(&mut instance)
                             .hint_text("比如 26.3-FO")
                             .desired_width(f32::INFINITY),
                     );
+                    theme::input_menu(&mut edit, &mut instance, false);
 
                     ui.add_space(6.0);
                     let hint = name_hint(&instance, game_dir);

@@ -471,17 +471,6 @@ fn text_of(root: &Json, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn entry(name: &str) -> ZipEntry {
-        ZipEntry {
-            name: name.to_string(),
-            compression: 0,
-            compressed_size: 0,
-            uncompressed_size: 0,
-            local_header_offset: 0,
-            is_dir: name.ends_with('/'),
-        }
-    }
-
     const MODRINTH: &str = r##"{
         "formatVersion": 1,
         "game": "minecraft",
@@ -661,8 +650,8 @@ mod tests {
     #[test]
     fn a_curseforge_pack_is_recognised_by_its_manifest() {
         let entries = vec![
-            entry("manifest.json"),
-            entry("overrides/config/x.toml"),
+            ZipEntry::stub("manifest.json"),
+            ZipEntry::stub("overrides/config/x.toml"),
         ];
         assert_eq!(sniff(&entries), Some(PackFormat::CurseForge));
     }
@@ -721,16 +710,16 @@ mod tests {
     #[test]
     fn the_manifest_file_decides_the_format() {
         assert_eq!(
-            sniff(&[entry("modrinth.index.json")]),
+            sniff(&[ZipEntry::stub("modrinth.index.json")]),
             Some(PackFormat::Modrinth)
         );
         assert_eq!(
-            sniff(&[entry("modpack.json"), entry("minecraft/pack.json")]),
+            sniff(&[ZipEntry::stub("modpack.json"), ZipEntry::stub("minecraft/pack.json")]),
             Some(PackFormat::Hmcl)
         );
-        assert_eq!(sniff(&[entry("readme.txt")]), None);
+        assert_eq!(sniff(&[ZipEntry::stub("readme.txt")]), None);
         // 只认顶层：藏在子目录里的不算
-        assert_eq!(sniff(&[entry("deep/modrinth.index.json")]), None);
+        assert_eq!(sniff(&[ZipEntry::stub("deep/modrinth.index.json")]), None);
     }
 
     #[test]

@@ -44,6 +44,18 @@ cargo build --release
 
 产物：`crates/aicraft-ui/target/release/AICraftLauncher.exe`。
 
+正版登录需要一份 Azure 应用的客户端 ID —— 它**不在源码里**，由编译期注入。任选一种方式提供：
+
+```bash
+# 1. 环境变量
+AICRAFT_CLIENT_ID=你的应用ID cargo build --release -p aicraft-core
+
+# 2. 仓库根放一个 .client-id 文件（已在 .gitignore 里）
+echo 你的应用ID > .client-id
+```
+
+两条都没有时编译照常通过，只是正版登录会直接提示「这一份构建没有带 Azure 应用 ID」。离线模式不受影响。
+
 ## 仓库结构
 
 ```
@@ -57,7 +69,7 @@ crates/
 
 ## 许可证
 
-[MIT](LICENSE)
+[GPL-3.0-or-later](LICENSE)
 
 ---
 

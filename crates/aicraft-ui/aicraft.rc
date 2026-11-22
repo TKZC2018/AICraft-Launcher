@@ -13,8 +13,8 @@
 // VERSIONINFO` 也能编译，但 rc.exe 会把名字保留成字符串，而 Windows 的
 // GetFileVersionInfo 只按 ID 1 查找——结果就是「属性 → 详细信息」一片空白。
 1 VERSIONINFO
-  FILEVERSION     0, 1, 0, 0
-  PRODUCTVERSION  0, 1, 0, 0
+  FILEVERSION     0, 2, 0, 0
+  PRODUCTVERSION  0, 2, 0, 0
   FILEFLAGSMASK   0x3fL   // VS_FFI_FILEFLAGSMASK
   FILEFLAGS       0       // 调试位、预发布位都不设
   FILEOS          0x40004L // VOS_NT_WINDOWS32
@@ -28,11 +28,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "AICraft"
             VALUE "FileDescription",  "AICraft Launcher"
-            VALUE "FileVersion",      "0.1.0"
+            VALUE "FileVersion",      "0.2.0"
             VALUE "InternalName",     "AICraftLauncher"
             VALUE "OriginalFilename", "AICraftLauncher.exe"
             VALUE "ProductName",      "AICraft Launcher"
-            VALUE "ProductVersion",   "0.1.0"
+            VALUE "ProductVersion",   "0.2.0"
         END
     END
     BLOCK "VarFileInfo"

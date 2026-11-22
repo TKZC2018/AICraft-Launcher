@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use aicraft_core::java;
 use aicraft_core::logging;
-use aicraft_core::settings::{LauncherMode, Mirror, Settings};
+use aicraft_core::settings::{LauncherMode, Mirror, Settings, WindowMode};
 use egui::RichText;
 
 use crate::theme;
@@ -17,12 +17,14 @@ use crate::theme;
 /// 只写路径的话，`C:\Program Files\Java\jdk-21\bin\javaw.exe` 太长会把
 /// 下拉框撑变形，而玩家真正在乎的是「Java 几」；扫到了就顺带把大版本写出来，
 /// 没扫到（或者指定的是列表外的）就老老实实显示路径。
-fn describe_java(path: &std::path::Path, runtimes: Option<&[java::JavaRuntime]>) -> String {
+pub(crate) fn describe_java(path: &std::path::Path, runtimes: Option<&[java::JavaRuntime]>) -> String {
     if let Some(rt) = runtimes.and_then(|list| list.iter().find(|rt| rt.path == path)) {
         return format!("Java {} · {}", rt.major_version, rt.home().display());
     }
     format!("已指定：{}", path.display())
 }
+
+
 
 /// 页面上表达的动作，出页面后由 `main.rs` 执行。
 pub enum Action {
@@ -64,6 +66,10 @@ pub struct JavaScan {
     extra: Vec<java::JavaRuntime>,
     /// 上一次添加失败的原因（路径不是 java.exe 之类）
     pub error: Option<String>,
+    /// 上一次添加成功时的说明，和 `error` 互斥。
+    pub note: Option<String>,
+    /// 设置文件里记下的那些手工路径，扫描时一起探一遍。
+    seeded: Vec<std::path::PathBuf>,
     rx: Option<Receiver<Vec<java::JavaRuntime>>>,
 }
 
@@ -81,11 +87,24 @@ impl JavaScan {
     ///
     /// 去重口径与 [`java::detect_all`] 一致（主版本 + 完整版本串）：
     /// 同一个 JDK 换个路径加进来，不该多出一行。
+    /// 记下设置文件里存着的手工路径。
+    ///
+    /// 扫描线程只认 JAVA_HOME / PATH / 常见安装目录，装在别处的 JDK 扫不到；
+    /// 这些是玩家自己挑过的，重启之后得原样回到列表里。
+    pub fn seed(&mut self, paths: &[String]) {
+        self.seeded = paths
+            .iter()
+            .map(|path| std::path::PathBuf::from(path.trim()))
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect();
+    }
+
     pub fn add(&mut self, rt: java::JavaRuntime) -> bool {
         fn same(a: &java::JavaRuntime, b: &java::JavaRuntime) -> bool {
             a.major_version == b.major_version && a.version_string == b.version_string
         }
         self.error = None;
+        self.note = None;
         match &mut self.runtimes {
             Some(list) => {
                 if list.iter().any(|k| same(k, &rt)) {
@@ -112,8 +131,14 @@ impl JavaScan {
         }
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
+        let seeded = std::mem::take(&mut self.seeded);
         std::thread::spawn(move || {
-            let _ = tx.send(java::detect_all());
+            let mut list = java::detect_all();
+            // 手工加进来的那些未必在扫描范围里，逐个探一遍再并进去。
+            let picked: Vec<java::JavaRuntime> =
+                seeded.iter().filter_map(|path| java::probe_java(path)).collect();
+            merge_into(&mut list, picked);
+            let _ = tx.send(list);
         });
     }
 
@@ -125,15 +150,8 @@ impl JavaScan {
         match rx.try_recv() {
             Ok(mut list) => {
                 // 扫描期间手动加进来的那些要并进去，否则它们会凭空消失
-                for rt in self.extra.drain(..) {
-                    let duplicate = list.iter().any(|k| {
-                        k.major_version == rt.major_version && k.version_string == rt.version_string
-                    });
-                    if !duplicate {
-                        list.push(rt);
-                    }
-                }
-                list.sort_by_key(|k| std::cmp::Reverse(k.major_version));
+                let extra = std::mem::take(&mut self.extra);
+                merge_into(&mut list, extra);
                 self.runtimes = Some(list);
                 true
             }
@@ -148,6 +166,19 @@ impl JavaScan {
             }
         }
     }
+}
+
+/// 把手工挑的运行时并进扫描结果：同主版本 + 同版本串的只留一条，最后按主版本降序。
+fn merge_into(list: &mut Vec<java::JavaRuntime>, extra: Vec<java::JavaRuntime>) {
+    for rt in extra {
+        let duplicate = list.iter().any(|k| {
+            k.major_version == rt.major_version && k.version_string == rt.version_string
+        });
+        if !duplicate {
+            list.push(rt);
+        }
+    }
+    list.sort_by_key(|k| std::cmp::Reverse(k.major_version));
 }
 
 /// 画设置页。所有控件直接改 `settings`。
@@ -192,25 +223,87 @@ pub fn page(
         divider(ui);
 
         // ---- 游戏运行时启动器状态 ----
-        ui.label(
-            RichText::new("游戏运行时启动器状态")
-                .size(12.0)
-                .color(theme::TEXT_WEAK),
-        );
-        ui.add_space(4.0);
-        // 下拉独占一行：和标题挤在一起时，右边那句「关闭启动器在游戏结束后
-        // 重新打开（默认）」太长，会把标题那行撑到几乎贴边。
-        ui.add_enabled_ui(!busy, |ui| {
-            let combo = egui::ComboBox::from_id_salt("launcher-mode")
-                .selected_text(RichText::new(settings.launcher_mode.label()).size(12.0))
-                .width(300.0)
-                .show_ui(ui, |ui| {
-                    for mode in LauncherMode::ALL {
-                        ui.selectable_value(&mut settings.launcher_mode, mode, mode.label());
-                    }
-                });
-            theme::hand(combo.response);
+        // 标题在左、控件在右，和这一页其它行一样：左边一列是「这一项叫什么」，
+        // 右边一列是「它现在是什么」，扫一眼就对上号。
+        setting_row(ui, "游戏运行时启动器状态", |ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                let combo = theme::combo(
+                    ui,
+                    "launcher-mode",
+                    RichText::new(settings.launcher_mode.label()).size(12.0),
+                    COMBO_W,
+                    |ui| {
+                        for mode in LauncherMode::ALL {
+                            ui.selectable_value(&mut settings.launcher_mode, mode, mode.label());
+                        }
+                    },
+                );
+                theme::hand(combo);
+            });
         });
+
+        divider(ui);
+
+        // ---- 游戏窗口大小 ----
+        setting_row(ui, "游戏窗口大小", |ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                let combo = theme::combo(
+                    ui,
+                    "window-size",
+                    RichText::new(window_text(settings)).size(12.0),
+                    COMBO_W,
+                    |ui| {
+                        for (index, text) in PRESETS.iter().enumerate() {
+                            if ui
+                                .selectable_label(window_preset(settings) == index, *text)
+                                .clicked()
+                            {
+                                apply_preset(settings, index);
+                            }
+                        }
+                    },
+                );
+                theme::hand(combo);
+            });
+        });
+        // 指定宽高之后总还能再调两个数：预设只是替玩家填一遍，不是锁死。
+        if settings.window_mode == WindowMode::Fixed {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    theme::hand(ui.add(
+                        egui::DragValue::new(&mut settings.window_width)
+                            .range(320..=8192)
+                            .speed(8.0),
+                    ));
+                    ui.label(RichText::new("×").size(12.0).color(theme::TEXT_WEAK));
+                    theme::hand(ui.add(
+                        egui::DragValue::new(&mut settings.window_height)
+                            .range(240..=8192)
+                            .speed(8.0),
+                    ));
+                });
+                ui.label(
+                    RichText::new("像素；游戏里按 F11 还能切全屏")
+                        .size(10.5)
+                        .color(theme::TEXT_WEAK),
+                );
+            });
+        } else if settings.window_mode == WindowMode::Maximized {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("铺满桌面，会留出任务栏")
+                    .size(10.5)
+                    .color(theme::TEXT_WEAK),
+            );
+        } else if settings.window_mode == WindowMode::Fullscreen {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("独占全屏，游戏里按 F11 或 Esc 能退出来")
+                    .size(10.5)
+                    .color(theme::TEXT_WEAK),
+            );
+        }
 
         divider(ui);
 
@@ -251,15 +344,19 @@ pub fn page(
         // 列表来自后台线程（`JavaScan`），这里不探测、不等候。
         java.start();
         let runtimes = java.runtimes();
-        // 下拉里要显示的当前选择：自动 / 指定的那一个。
+        // 这里只说「自动还是指定的那一个」。自动到底会挑到哪个 Java 是
+        // 每份版本各自的事（清单不同、要的主版本也不同），写在这一页只会
+        // 让人以为全局有个固定的答案——那一句放在管理页的游戏设置里。
         let current_text = match &settings.java_path {
             None => "自动选择".to_string(),
             Some(path) => describe_java(path, runtimes),
         };
-        let combo = egui::ComboBox::from_id_salt("java-choice")
-            .selected_text(RichText::new(current_text).size(12.0))
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
+        let combo = theme::combo(
+            ui,
+            "java-choice",
+            RichText::new(current_text).size(12.0),
+            ui.available_width(),
+            |ui| {
                 ui.selectable_value(&mut settings.java_path, None, "自动选择");
                 match runtimes {
                     None => {
@@ -283,13 +380,50 @@ pub fn page(
                         }
                     }
                 }
-            });
-        theme::hand(combo.response);
+            },
+        );
+        theme::hand(combo);
 
         if let Some(error) = &java.error {
             ui.add_space(2.0);
             ui.label(RichText::new(error.clone()).size(10.5).color(theme::DANGER));
         }
+        if let Some(note) = &java.note {
+            ui.add_space(2.0);
+            ui.label(RichText::new(note.clone()).size(10.5).color(theme::TEXT_WEAK));
+        }
+
+        // 下拉只回答「现在用哪个」，看不到「本机到底有哪几个、各在哪儿」。
+        // 所以下面把扫到的逐个列出来：版本号、完整版本串、路径一眼扫完，
+        // 点一行就是换过去——比展开下拉再找一遍省事。
+        if let Some(list) = runtimes
+            && !list.is_empty() {
+            ui.add_space(8.0);
+            java_list(ui, list, settings.java_path.as_deref());
+        }
+
+        divider(ui);
+
+        // ---- 显卡 ----
+        // 双显卡笔记本上最常见的一句抱怨是「同样的整合包，别人 120 帧我 40」，
+        // 原因往往是 Windows 把 javaw.exe 派给了核显。系统那个设置页藏得深，
+        // 这里给一个开关，启动时替玩家写那条偏好。
+        setting_row(ui, "使用高性能显卡", |ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                if theme::switch(ui, "", settings.high_performance_gpu, !busy).clicked() {
+                    settings.high_performance_gpu = !settings.high_performance_gpu;
+                }
+            });
+        });
+        ui.label(
+            RichText::new(
+                "启动游戏时把这次挑中的 Java 指定为「高性能」，走独立显卡；\
+                 关掉后下次启动会把那条指定撤掉。只影响这台电脑上的这个 java.exe，\
+                 不改任何系统设置，随时能在 Windows「显示卡」里看到。",
+            )
+            .size(10.5)
+            .color(theme::TEXT_WEAK),
+        );
     });
     ui.add_space(14.0);
 
@@ -352,6 +486,7 @@ pub fn page(
                 );
             }
         });
+
     });
 
     ui.add_space(14.0);
@@ -360,12 +495,13 @@ pub fn page(
     section(ui, "JVM 参数");
     theme::card().show(ui, |ui| {
         ui.set_width(card_width);
-        ui.add(
+        let mut resp = ui.add(
             egui::TextEdit::multiline(&mut settings.jvm_args)
                 .hint_text("-XX:+UseG1GC -Dfile.encoding=UTF-8")
                 .desired_rows(2)
                 .desired_width(f32::INFINITY),
         );
+        theme::input_menu(&mut resp, &mut settings.jvm_args, false);
         ui.label(
             RichText::new(
                 "按空白/换行切成参数，追加在版本自带的 JVM 参数之后；\
@@ -478,6 +614,123 @@ pub fn page(
 ///
 /// 两端各缩进 `LOG_RULE_INSET`：从边框一路拉通到边框会跟外面那圈卡片描边
 /// 接成一条，看起来像卡片被切开了；留白之后才读得出「这是行与行的界」。
+/// 把扫到的 Java 逐个列出来（只是展示，不在这里选）。
+///
+/// 一行一个：左边「Java 21」和完整版本串，右边安装路径，正在用的那个末尾挂
+/// 一枚「使用中」。整块套一层浅灰内凹底，跟上面的表单分开——它回答的是「本机
+/// 有什么」，不是「现在用哪个」（那是上面那个下拉的事）。
+///
+/// 路径单行截断而不是折行：同一台机器上的几个 JDK 往往只差最后一级目录
+/// （`jdk-21` / `jdk-21.0.4`），折成两行反而比不出区别。
+fn java_list(ui: &mut egui::Ui, list: &[java::JavaRuntime], current: Option<&std::path::Path>) {
+    const ROW_H: f32 = 38.0;
+    const NAME_W: f32 = 92.0;
+
+    theme::inset().show(ui, |ui| {
+        let width = ui.available_width();
+        for (i, rt) in list.iter().enumerate() {
+            if i > 0 {
+                // 行与行之间留一点缝，不然几行灰字会糊成一段。
+                ui.add_space(2.0);
+            }
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ROW_H), egui::Sense::hover());
+            let inner = rect.shrink2(egui::vec2(6.0, 0.0));
+
+            ui.painter().text(
+                egui::pos2(inner.left(), inner.center().y - 7.0),
+                egui::Align2::LEFT_CENTER,
+                format!("Java {}", rt.major_version),
+                egui::FontId::proportional(12.0),
+                theme::TEXT,
+            );
+            ui.painter().text(
+                egui::pos2(inner.left(), inner.center().y + 8.0),
+                egui::Align2::LEFT_CENTER,
+                &rt.version_string,
+                egui::FontId::proportional(10.0),
+                theme::TEXT_FAINT,
+            );
+
+            // 右边先排「使用中」，再排「32 位」，剩下的宽度全给路径。
+            let mut right = inner.right();
+            if current == Some(rt.path.as_path()) {
+                let galley = ui.painter().layout_no_wrap(
+                    "使用中".to_string(),
+                    egui::FontId::proportional(10.0),
+                    theme::accent_strong(),
+                );
+                let tag = egui::Rect::from_center_size(
+                    egui::pos2(right - galley.size().x / 2.0, inner.center().y),
+                    galley.size() + egui::vec2(12.0, 4.0),
+                );
+                ui.painter()
+                    .rect_filled(tag, egui::CornerRadius::same(5), theme::accent_soft());
+                ui.painter().galley(
+                    egui::pos2(
+                        tag.center().x - galley.size().x / 2.0,
+                        tag.center().y - galley.size().y / 2.0,
+                    ),
+                    galley,
+                    theme::accent_strong(),
+                );
+                right = tag.left() - 8.0;
+            }
+            if !rt.is_64bit {
+                let galley = ui.painter().layout_no_wrap(
+                    "32 位".to_string(),
+                    egui::FontId::proportional(10.0),
+                    theme::WARN,
+                );
+                let tag = egui::Rect::from_center_size(
+                    egui::pos2(right - galley.size().x / 2.0, inner.center().y),
+                    galley.size() + egui::vec2(10.0, 2.0),
+                );
+                ui.painter().rect_filled(
+                    tag,
+                    egui::CornerRadius::same(5),
+                    theme::WARN_TINT,
+                );
+                ui.painter().galley(
+                    egui::pos2(
+                        tag.center().x - galley.size().x / 2.0,
+                        tag.center().y - galley.size().y / 2.0,
+                    ),
+                    galley,
+                    theme::WARN,
+                );
+                right = tag.left() - 10.0;
+            }
+
+            let path_left = inner.left() + NAME_W;
+            let room = (right - path_left).max(40.0);
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                &rt.path.display().to_string(),
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(10.5),
+                    color: theme::TEXT_WEAK,
+                    ..Default::default()
+                },
+            );
+            job.wrap = egui::text::TextWrapping {
+                max_rows: 1,
+                break_anywhere: true,
+                overflow_character: Some('…'),
+                ..Default::default()
+            };
+            job.wrap.max_width = room;
+            let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
+            // 左对齐，让几行的盘符和层级竖着对齐——路径是要竖着扫的。
+            ui.painter().galley(
+                egui::pos2(path_left, inner.center().y - galley.size().y / 2.0),
+                galley,
+                theme::TEXT_WEAK,
+            );
+        }
+    });
+}
+
 fn log_rule(ui: &mut egui::Ui) {
     ui.add_space(LOG_RULE_GAP);
     let width = ui.available_width();
@@ -485,7 +738,7 @@ fn log_rule(ui: &mut egui::Ui) {
     ui.painter().hline(
         egui::Rangef::new(rect.left() + LOG_RULE_INSET, rect.right() - LOG_RULE_INSET),
         rect.center().y,
-        egui::Stroke::new(1.0, LOG_RULE_COLOR),
+        egui::Stroke::new(1.0, theme::RULE),
     );
     ui.add_space(LOG_RULE_GAP);
 }
@@ -518,10 +771,6 @@ const LOG_RULE_INSET: f32 = 10.0;
 
 /// 分隔线上下各留多少空隙。
 const LOG_RULE_GAP: f32 = 5.0;
-
-/// 分隔线的颜色：比卡片描边更淡一档，它一天要出现十来条，
-/// 和 `theme::BORDER` 一个浓度会抢正文的视线。
-const LOG_RULE_COLOR: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xED, 0xF4);
 
 /// `theme::inset()` 的上下内边距之和（`Margin::symmetric(12, 10)`）。
 const INSET_PADDING_Y: f32 = 20.0;
@@ -562,13 +811,24 @@ fn mirror_row(ui: &mut egui::Ui, label: &str, current: &mut Mirror) {
     });
 }
 
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.label(
-        RichText::new(title)
-            .size(12.5)
-            .strong()
-            .color(theme::ACCENT_STRONG),
-    );
+pub(crate) fn section(ui: &mut egui::Ui, title: &str) {
+    let text = RichText::new(title)
+        .size(12.5)
+        .strong()
+        .color(theme::accent_strong());
+    if theme::wallpaper_active() {
+        // 有底图时这一行是直接压在照片上的：小号绿字碰上亮云彩就没了。
+        // 垫一块跟卡片同色的薄底，既压得住字，也不像凭空多出一个框。
+        egui::Frame::NONE
+            .fill(theme::card_fill())
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(8, 3))
+            .show(ui, |ui| {
+                ui.label(text);
+            });
+    } else {
+        ui.label(text);
+    }
     ui.add_space(4.0);
 }
 
@@ -596,10 +856,9 @@ fn memory_body(ui: &mut egui::Ui, settings: &mut Settings) {
         if theme::radio(ui, !settings.auto_memory, "手动选择内存").clicked() {
             // 从自动切到手动时，把手动值对齐到自动那一档 ——
             // 否则玩家会看到一个自己没设过的数字，还得先想「这是哪儿来的」。
-            if settings.auto_memory {
-                if let Some(mb) = recommended {
-                    settings.max_memory_mb = mb;
-                }
+            if settings.auto_memory
+                && let Some(mb) = recommended {
+                settings.max_memory_mb = mb;
             }
             settings.auto_memory = false;
         }
@@ -679,25 +938,38 @@ fn memory_body(ui: &mut egui::Ui, settings: &mut Settings) {
 }
 
 /// 内存滑块的下限，与 [`aicraft_core::settings::Settings::clamp`] 同口径。
-const MEMORY_FLOOR_MB: u32 = 512;
+pub(crate) const MEMORY_FLOOR_MB: u32 = 512;
 /// 探不到本机内存时的滑块上限。
-const MEMORY_CEIL_MB: u32 = 65536;
+pub(crate) const MEMORY_CEIL_MB: u32 = 65536;
 
 /// 滑块上限：留一点给系统，最多到 32 GiB。
 ///
 /// 上限跟着机器走的好处是刻度有意义 —— 全程都落在「这台机器上可能用到的
 /// 范围」里，拖到底就是「这台机器能给的最多」。固定用 65536 的话，
 /// 在 16 GiB 的机器上九成的行程都是不可能的值。
-fn slider_ceiling(total_mb: u64) -> u32 {
+pub(crate) fn slider_ceiling(total_mb: u64) -> u32 {
     let headroom = total_mb.saturating_sub(1024);
     (headroom as u32).clamp(4096, 32768)
 }
 
-/// 把任意值对齐到 64 的倍数。
+/// 1024 整数倍两侧的「磁吸」范围（MiB）。
+///
+/// 玩家真正想要的是 2 GiB、4 GiB、8 GiB 这种整数档，而滑块按 64 走，
+/// 4096 一带很容易落在 4032 或 4160 上，看着像「差一点」。所以在每个
+/// 1024 的整数倍两侧各留这么宽，落进来就直接贴上去；出了这个范围还是
+/// 老老实实按 64 走，不然细调就没法用了。
+const SNAP_1024_WINDOW_MB: u32 = 128;
+
+/// 把任意值对齐到 64 的倍数，并在 1024 的整数倍附近磁吸过去。
 ///
 /// 玩家拖动滑块时不需要 3721 这种数；64 一档，数字好看，也够细。
-fn snap_mb(mb: u32) -> u32 {
-    let snapped = (mb.saturating_add(32) / 64) * 64;
+pub(crate) fn snap_mb(mb: u32) -> u32 {
+    let nearest_1024 = (mb.saturating_add(512) / 1024) * 1024;
+    let snapped = if nearest_1024 >= 1024 && mb.abs_diff(nearest_1024) <= SNAP_1024_WINDOW_MB {
+        nearest_1024
+    } else {
+        (mb.saturating_add(32) / 64) * 64
+    };
     snapped.clamp(MEMORY_FLOOR_MB, MEMORY_CEIL_MB)
 }
 
@@ -713,7 +985,7 @@ fn memory_bar(ui: &mut egui::Ui, memory: aicraft_core::meminfo::Memory, game_mb:
     painter.rect_filled(
         rect,
         egui::CornerRadius::same(4),
-        egui::Color32::from_rgb(0xE7, 0xED, 0xF5),
+        theme::TRACK,
     );
     let used = memory.used_mb() as f32 / memory.total_mb.max(1) as f32;
     let used_right = rect.left() + rect.width() * used.clamp(0.0, 1.0);
@@ -765,7 +1037,42 @@ fn memory_bar(ui: &mut egui::Ui, memory: aicraft_core::meminfo::Memory, game_mb:
     });
 }
 
-fn divider(ui: &mut egui::Ui) {
+/// 一行「左边名字、右边控件」。
+///
+/// 这一页的设置项统一成这个形状：左列是「这一项叫什么」，右列是「它现在
+/// 是什么」。以前标题占一行、控件另起一行，两项并排看着像四行，读的时候
+/// 还得来回对；现在一行就是一项，眼睛扫一遍就到底。
+///
+/// 名字那列固定占 [`LABEL_W`]，剩下的都给控件，所以几行的控件左边缘是齐的。
+pub(crate) fn setting_row(ui: &mut egui::Ui, name: &str, control: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(LABEL_W, ROW_H),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(
+                    RichText::new(name)
+                        .size(12.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            },
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            control(ui);
+        });
+    });
+}
+
+/// [`setting_row`] 左边名字那一列的宽度。
+const LABEL_W: f32 = 170.0;
+
+/// 这一页下拉框统一收这么宽，几行的控件才对得齐。
+const COMBO_W: f32 = 300.0;
+
+/// [`setting_row`] 一行的高度；下拉框比文字高，按控件算。
+const ROW_H: f32 = 26.0;
+
+pub(crate) fn divider(ui: &mut egui::Ui) {
     ui.add_space(9.0);
     let (rect, _) = ui.allocate_exact_size(
         egui::Vec2::new(ui.available_width(), 1.0),
@@ -779,10 +1086,83 @@ fn divider(ui: &mut egui::Ui) {
     ui.add_space(9.0);
 }
 
+/// 「游戏窗口大小」下拉框里的条目，顺序就是 `window_preset` 的索引。
+///
+/// 预设不单独存进设置里——「1280 × 720」和玩家手填的 1280×720 在磁盘上
+/// 是同一样东西，界面按数值反查回来即可。这样预设表以后增删也不会让旧配置失配。
+const PRESETS: [&str; 8] = [
+    "自动",
+    "1280 × 720",
+    "1600 × 900",
+    "1920 × 1080",
+    "2560 × 1440",
+    "自定义…",
+    "最大化",
+    "全屏",
+];
+
+/// 「自定义…」在 `PRESETS` 里的下标。
+const CUSTOM_INDEX: usize = 5;
+
+/// 常见分辨率，跟 `PRESETS` 里第 1..=4 项一一对应。
+const SIZES: [(u32, u32); 4] = [(1280, 720), (1600, 900), (1920, 1080), (2560, 1440)];
+
+/// 当前设置对应下拉框里哪一条。
+fn window_preset(settings: &Settings) -> usize {
+    match settings.window_mode {
+        WindowMode::Auto => 0,
+        WindowMode::Maximized => PRESETS.len() - 2,
+        WindowMode::Fullscreen => PRESETS.len() - 1,
+        WindowMode::Fixed => SIZES
+            .iter()
+            .position(|&(w, h)| w == settings.window_width && h == settings.window_height)
+            .map(|index| index + 1)
+            // 对不上任何一个预设就是玩家自己填的，落到「自定义…」
+            .unwrap_or(CUSTOM_INDEX),
+    }
+}
+
+/// 下拉框收起时显示的那一行文字。
+fn window_text(settings: &Settings) -> String {
+    let index = window_preset(settings);
+    if index == CUSTOM_INDEX {
+        // 自定义：把具体数字写出来，否则收起后看不出到底多大
+        return format!(
+            "自定义 {} × {}",
+            settings.window_width, settings.window_height
+        );
+    }
+    PRESETS[index].to_string()
+}
+
+/// 玩家在下拉框里点了第 `index` 条。
+fn apply_preset(settings: &mut Settings, index: usize) {
+    match index {
+        // 自动：不动宽高，切回自动之后再选「指定」还是上次那两个数
+        0 => settings.window_mode = WindowMode::Auto,
+        // 四个预设：把手填值也一起写上，切到「自定义」时能接着改
+        n if n - 1 < SIZES.len() => {
+            let (width, height) = SIZES[n - 1];
+            settings.window_mode = WindowMode::Fixed;
+            settings.window_width = width;
+            settings.window_height = height;
+        }
+        // 自定义：只切模式，具体数字交给下面两个输入框
+        CUSTOM_INDEX => settings.window_mode = WindowMode::Fixed,
+        // 最后一条是「全屏」，倒数第二条是「最大化」
+        n if n == PRESETS.len() - 1 => settings.window_mode = WindowMode::Fullscreen,
+        _ => settings.window_mode = WindowMode::Maximized,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{scope_text, slider_ceiling, snap_mb, JavaScan};
+    use super::{
+        apply_preset, scope_text, slider_ceiling, snap_mb, window_preset, window_text, JavaScan,
+        CUSTOM_INDEX, PRESETS,
+    };
     use aicraft_core::logging::Level;
+    use aicraft_core::settings::{Settings, WindowMode};
 
     fn runtime(major: u32, version: &str) -> aicraft_core::java::JavaRuntime {
         aicraft_core::java::JavaRuntime {
@@ -801,6 +1181,29 @@ mod tests {
         assert!(scan.add(runtime(21, "21.0.4")));
         assert!(!scan.add(runtime(21, "21.0.4")));
         assert!(scan.add(runtime(17, "17.0.11")));
+    }
+
+    #[test]
+    fn a_merged_list_keeps_one_row_per_runtime() {
+        // 扫描已经扫到 21，手工又加了同一个 21 和另一台 17：17 进去，21 不重复。
+        let mut list = vec![runtime(21, "21.0.4")];
+        super::merge_into(&mut list, vec![runtime(21, "21.0.4"), runtime(17, "17.0.11")]);
+        assert_eq!(list.len(), 2);
+        // 新的排在前面（按主版本降序）
+        assert_eq!(list[0].major_version, 21);
+        assert_eq!(list[1].major_version, 17);
+    }
+
+    #[test]
+    fn seeded_paths_are_remembered_until_the_scan_starts() {
+        let mut scan = JavaScan::default();
+        scan.seed(&[
+            "C:\\Java\\jdk-21\\bin\\javaw.exe".to_string(),
+            "   ".to_string(),
+        ]);
+        // 空白项丢掉，剩一条等着扫描线程去探
+        assert_eq!(scan.seeded.len(), 1);
+        assert!(scan.seeded[0].ends_with("javaw.exe"));
     }
 
     #[test]
@@ -830,12 +1233,27 @@ mod tests {
     #[test]
     fn dragged_values_snap_to_64() {
         assert_eq!(snap_mb(4096), 4096);
-        assert_eq!(snap_mb(4100), 4096);
-        assert_eq!(snap_mb(4120), 4096);
-        assert_eq!(snap_mb(4133), 4160);
+        // 3900 离 4096 已经有 196 MiB，超出磁吸范围，按 64 一档走。
+        assert_eq!(snap_mb(3900), 3904);
+        assert_eq!(snap_mb(4400), 4416);
         // 两端要夹住
         assert_eq!(snap_mb(0), 512);
         assert_eq!(snap_mb(999_999), 65536);
+    }
+
+    #[test]
+    fn whole_gigabyte_numbers_are_magnetic() {
+        // 4096 两侧各 128 MiB 以内都贴到 4096，而不是 4032 / 4160。
+        assert_eq!(snap_mb(4032), 4096);
+        assert_eq!(snap_mb(4100), 4096);
+        assert_eq!(snap_mb(4200), 4096);
+        assert_eq!(snap_mb(4224), 4096);
+        // 出圈就退回 64 一档。
+        assert_eq!(snap_mb(4300), 4288);
+        assert_eq!(snap_mb(8192), 8192);
+        assert_eq!(snap_mb(8100), 8192);
+        // 下限 512 不是 1024 的倍数，不能被吸到 1024 去。
+        assert_eq!(snap_mb(600), 576);
     }
 
     #[test]
@@ -850,5 +1268,52 @@ mod tests {
         assert!(text.contains('1'), "{}", text);
         assert!(text.contains('9'), "{}", text);
         assert!(text.contains("错误"), "{}", text);
+    }
+
+    #[test]
+    fn every_preset_can_be_picked_back_up() {
+        let mut settings = Settings::default();
+        for index in 0..PRESETS.len() {
+            // 「自定义…」只是个切换模式的动作，它不产生新尺寸 —— 磁盘上存的是
+            // 那对数字，反查回来必然落回某个具体预设（或仍然算自定义），
+            // 所以这一条由 `a_hand_typed_size_is_called_custom` 单独覆盖。
+            if index == CUSTOM_INDEX {
+                continue;
+            }
+            apply_preset(&mut settings, index);
+            assert_eq!(window_preset(&settings), index, "{:?}", settings.window_mode);
+        }
+    }
+
+    #[test]
+    fn a_hand_typed_size_is_called_custom() {
+        let settings = Settings {
+            window_mode: WindowMode::Fixed,
+            window_width: 1760,
+            window_height: 990,
+            ..Settings::default()
+        };
+        assert_eq!(window_preset(&settings), CUSTOM_INDEX);
+        // 收起后要看得见具体数字，不然「自定义…」等于什么都没说
+        let text = window_text(&settings);
+        assert!(text.contains("1760") && text.contains("990"), "{}", text);
+    }
+
+    #[test]
+    fn picking_a_preset_fills_both_numbers() {
+        let mut settings = Settings::default();
+        apply_preset(&mut settings, 3); // 1920 × 1080
+        assert_eq!(settings.window_mode, WindowMode::Fixed);
+        assert_eq!((settings.window_width, settings.window_height), (1920, 1080));
+    }
+
+    #[test]
+    fn auto_keeps_the_last_numbers() {
+        let mut settings = Settings::default();
+        apply_preset(&mut settings, 1); // 1280 × 720
+        apply_preset(&mut settings, 0); // 自动
+        assert_eq!(settings.window_mode, WindowMode::Auto);
+        // 切回自动不该把宽高清零：玩家再选「自定义」时还能接着改
+        assert_eq!((settings.window_width, settings.window_height), (1280, 720));
     }
 }

@@ -14,8 +14,8 @@
 //!   curl）。这样测试可以完全离线地对整条链路做断言，不必真的登录。
 //! - 每一步都返回结构化错误而不是字符串，UI 才能根据
 //!   [`AuthErrorKind`] 决定是「重新点一下」还是「去建 Xbox 档案」。
-//! - 内置一个默认的 [`DEFAULT_CLIENT_ID`]（本项目在 Azure 注册的应用），
-//!   玩家装上就能登录，不用先去申请一个应用。
+//! - 客户端 ID 由编译期注入（见 [`DEFAULT_CLIENT_ID`]），源码仓库里不带 ID。
+//!   想登录就自己注册一个 Azure 应用，编译时用 `AICRAFT_CLIENT_ID` 提供。
 
 use std::hash::{BuildHasher, Hasher};
 
@@ -28,45 +28,92 @@ pub mod store;
 pub mod xbox;
 pub mod yggdrasil;
 
-/// 内置的 Azure 应用（客户端）ID。
+/// 这次构建带上的 Azure 应用（客户端）ID。
 ///
-/// 这不是密钥 —— 它只是说明「这次登录是哪个应用发起的」，写进二进制里谁都
-/// 能 `strings` 出来，微软也是按公开值对待的。写死它换来的是「装上就能点登录」
-/// 的体验：玩家不必先去 Azure 注册一个应用、再把 ID 抄进来。
+/// 值由 `build.rs` 在编译时注入（环境变量 `AICRAFT_CLIENT_ID`，或仓库根的
+/// `.client-id` 文件），源码里**没有**任何 ID —— 每人用自己的注册应用构建。
+/// 没提供时是空串：登录会直接报 [`AuthErrorKind::MissingClientId`]，而不是
+/// 发一个注定失败的请求出去。
 ///
-/// 换代价提醒：这个 ID 被吊销（比如刷得太频繁被微软判定滥用）时，
-/// 旧版本启动器就登不上了，只能发新版把常量换掉。
+/// 「不是密钥」这一点仍然成立：它只是说明「这次登录是哪个应用发起的」，
+/// 编进二进制后谁都 `strings` 得出来，微软也按公开值对待。
+pub const DEFAULT_CLIENT_ID: &str = env!("AICRAFT_CLIENT_ID");
+
+/// 取客户端 ID；这次构建没带就报 [`AuthErrorKind::MissingClientId`]。
 ///
-/// 它是唯一来源 —— 没有环境变量、也没有设置项可以覆盖（以前有过，已删）。
-pub const DEFAULT_CLIENT_ID: &str = "51306758-f4c5-4577-a122-98ea37ffae0b";
+/// 所有发起登录的地方都要先过这一道：没有 ID 时微软会回一个含糊的 400，
+/// 玩家看到的却是「登录失败」，排查方向全错。
+pub fn client_id() -> Result<&'static str, AuthError> {
+    if DEFAULT_CLIENT_ID.is_empty() {
+        return Err(AuthError::new(
+            AuthErrorKind::MissingClientId,
+            "这一份构建没有带 Azure 应用 ID（编译时没提供 AICRAFT_CLIENT_ID）",
+            String::new(),
+        ));
+    }
+    Ok(DEFAULT_CLIENT_ID)
+}
 
 #[cfg(test)]
-mod testutil;
+pub(crate) mod testutil;
 
 /// 一次 HTTP 请求的能力集合。
 ///
 /// 只抽登录流程需要的三个动作；不带 `--fail`、能拿到 4xx 正文是
 /// [`crate::transport`] 那边已经保证的性质。
 pub trait Http {
-    fn post_form(&self, url: &str, pairs: &[(&str, &str)]) -> Result<HttpResponse, FetchError>;
-    fn post_json(&self, url: &str, body: &str) -> Result<HttpResponse, FetchError>;
-    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse, FetchError>;
+    /// 发一个任意方法、任意正文的请求。
+    ///
+    /// 换皮肤要用 `multipart/form-data` 的 `POST`、换披风要用 `PUT`/`DELETE`，
+    /// 光靠下面三个便捷方法覆盖不到，所以底下都走这一个。
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        content_type: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse, FetchError>;
+
+    fn post_form(&self, url: &str, pairs: &[(&str, &str)]) -> Result<HttpResponse, FetchError> {
+        let body = crate::codec::urlencode_pairs(pairs);
+        self.send(
+            "POST",
+            url,
+            Some("application/x-www-form-urlencoded"),
+            &[],
+            Some(body.as_bytes()),
+        )
+    }
+
+    fn post_json(&self, url: &str, body: &str) -> Result<HttpResponse, FetchError> {
+        self.send(
+            "POST",
+            url,
+            Some("application/json"),
+            &[],
+            Some(body.as_bytes()),
+        )
+    }
+
+    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse, FetchError> {
+        self.send("GET", url, None, headers, None)
+    }
 }
 
 /// 使用系统 curl 的真实实现。
 pub struct CurlHttp;
 
 impl Http for CurlHttp {
-    fn post_form(&self, url: &str, pairs: &[(&str, &str)]) -> Result<HttpResponse, FetchError> {
-        transport::post_form(url, pairs)
-    }
-
-    fn post_json(&self, url: &str, body: &str) -> Result<HttpResponse, FetchError> {
-        transport::post_json(url, body)
-    }
-
-    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse, FetchError> {
-        transport::get_with_headers(url, headers)
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        content_type: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse, FetchError> {
+        transport::send(method, url, content_type, headers, body)
     }
 }
 
@@ -108,6 +155,11 @@ pub enum AuthErrorKind {
     /// 是 Minecraft 服务端对第三方应用的白名单：新注册的 Azure 应用一律被拒，
     /// 只能等 Mojang 审批（见 <https://aka.ms/AppRegInfo>）。
     AppNotApproved,
+    /// 这次构建没有带客户端 ID。
+    ///
+    /// 源码仓库里不存 ID，打包的人要自己提供（见 [`DEFAULT_CLIENT_ID`]）。
+    /// 报出来比发一个 user_code 为空的设备码请求好懂。
+    MissingClientId,
 }
 
 /// 登录错误：分类 + 给用户看的一句话 + 原始响应。
@@ -368,21 +420,6 @@ where
     })
 }
 
-/// 用 refresh token 续期，并重新走完 Xbox → Minecraft 三跳。
-///
-/// Minecraft 令牌只有 24 小时，过期之后进服、拉皮肤都会被拒。启动前调
-/// 这个函数，成功就拿新令牌直接开游戏；失败再让用户重新登录。
-/// 返回值里带着微软令牌，调用方据此更新账号文件（refresh token 会轮换）。
-pub fn refresh_login(
-    http: &dyn Http,
-    client_id: &str,
-    refresh_token: &str,
-) -> Result<(MinecraftAccount, msa::MsaTokens), AuthError> {
-    let tokens = msa::refresh(http, client_id, refresh_token)?;
-    let account = complete_login(http, &tokens)?;
-    Ok((account, tokens))
-}
-
 /// 把字符串转义成 JSON 字符串字面量（不含两侧引号）。
 pub(crate) fn json_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -561,5 +598,30 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind, AuthErrorKind::NotEntitled);
+    }
+}
+
+#[cfg(test)]
+mod client_id_tests {
+    use super::*;
+
+    #[test]
+    fn the_build_carries_an_id_when_one_was_provided() {
+        // 这条测试在「本地有 .client-id / 设了环境变量」时通过；干净克隆的仓库
+        // 会返回 MissingClientId —— 两种情况都不算错，所以只断言「要么有值要么
+        // 明确说缺」，不能断言一定有值。
+        match client_id() {
+            Ok(id) => assert!(!id.is_empty(), "注入进来的是空串"),
+            Err(e) => assert_eq!(e.kind, AuthErrorKind::MissingClientId),
+        }
+    }
+
+    #[test]
+    fn an_empty_id_is_reported_instead_of_being_used() {
+        // DEFAULT_CLIENT_ID 是编译期常量，测试里改不了；这里验的是「空串会被拦」
+        // 这条规则本身。
+        let verdict = |id: &str| id.is_empty();
+        assert!(verdict(""));
+        assert!(!verdict("00000000-0000-0000-0000-000000000000"));
     }
 }

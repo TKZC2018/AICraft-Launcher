@@ -39,15 +39,16 @@ impl MockHttp {
 }
 
 impl Http for MockHttp {
-    fn post_form(&self, url: &str, pairs: &[(&str, &str)]) -> Result<HttpResponse, FetchError> {
-        self.next("POST", url, &crate::codec::urlencode_pairs(pairs))
-    }
-
-    fn post_json(&self, url: &str, body: &str) -> Result<HttpResponse, FetchError> {
-        self.next("POST", url, body)
-    }
-
-    fn get(&self, url: &str, _headers: &[(&str, &str)]) -> Result<HttpResponse, FetchError> {
-        self.next("GET", url, "")
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        _content_type: Option<&str>,
+        _headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse, FetchError> {
+        // 皮肤上传是二进制，日志里只留能读的部分；断言看前缀与字段名即可。
+        let text = body.map(|bytes| String::from_utf8_lossy(bytes).to_string());
+        self.next(method, url, text.as_deref().unwrap_or(""))
     }
 }

@@ -204,11 +204,12 @@ fn name_modal(ctx: &egui::Context, wizard: &mut Wizard, game_dir: &Path) -> Outc
                     .size(11.5)
                     .color(theme::TEXT_WEAK),
             );
-            let edit = ui.add(
+            let mut edit = ui.add(
                 egui::TextEdit::singleline(&mut wizard.instance)
                     .hint_text("比如 26.3-生存")
                     .desired_width(f32::INFINITY),
             );
+            theme::input_menu(&mut edit, &mut wizard.instance, false);
 
             ui.add_space(6.0);
             match &hint {

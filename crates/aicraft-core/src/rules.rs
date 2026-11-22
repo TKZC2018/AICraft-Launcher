@@ -334,6 +334,24 @@ impl Rule {
     }
 }
 
+/// 展开 classifier 里的 `${arch}` 占位符（老版本写法）。
+///
+/// 安装（[\`crate::install\`]）与启动（[\`crate::launch\`]）两边都要按同一个
+/// 位数去找 native jar，展开规则留在这里一份：两边各写一遍，改了一边就会
+/// 出现「装的时候挑 64 位、启动的时候挑 32 位」这种只在 32 位系统上炸的错。
+pub fn expand_arch_placeholder(classifier: &str, ctx: &RuleContext) -> String {
+    if !classifier.contains("${arch}") {
+        return classifier.to_string();
+    }
+    let bits = match ctx.os.arch {
+        Arch::X86 => "32",
+        // 64 位 ARM 在 Minecraft 老版本里没有对应 native，
+        // 按 64 位 Intel 处理是唯一可行的兜底。
+        _ => "64",
+    };
+    classifier.replace("${arch}", bits)
+}
+
 /// 求值一组规则。
 ///
 /// 空规则表示「无限制」，返回 true。

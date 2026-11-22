@@ -1,9 +1,12 @@
-//! 服务端管理：下载服务端核心、生成启动脚本、编辑 `server.properties`。
+//! 服务端管理：下载服务端核心、生成启动脚本、编辑已有的 `server.properties`。
 //!
 //! 启动器自己**不**常驻服务端进程（那要接管 stdout、处理 Ctrl+C、做终端渲染，
 //! 完全是另一套东西）。这一层只负责把一份能跑的服务端摆到磁盘上：
-//! 核心 jar、`eula.txt`、`server.properties`、以及一个 `start.bat`。
+//! 核心 jar、`eula.txt`、以及一个 `start.bat`。
 //! 玩家双击脚本就能开服，控制台归他自己的终端窗口。
+//!
+//! `server.properties` **不由启动器生成**——它归 Minecraft 自己，第一次启动
+//! 时才出现。没有它的时候，界面也不会摆一份「看起来像配置」的表单出来。
 //!
 //! 四种核心的落地方式差别很大：
 //!
@@ -14,6 +17,8 @@
 //!   `libraries/`；启动脚本转手调它。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::json::{self, Json};
 
@@ -140,6 +145,24 @@ pub struct Server {
     /// 是不是我们装出来的（有 [`MARKER`]）。从别处搬来的目录是 false——
     /// 那种目录只能「移出列表」，不能由我们删。
     pub managed: bool,
+    /// 目录里到底有没有认出来的服务端核心。
+    ///
+    /// 玩家手动加进来的目录，可能只是个空文件夹，或者根本不是开服目录。
+    /// 那种也得留在列表里（他刚选过，突然消失会让人以为操作失败了），
+    /// 但要如实说「没认出来」，并给他一个就地装一个的入口。
+    pub recognized: bool,
+    /// 这一份是不是套在 MCDReforged 下面。
+    ///
+    /// 是的话，真正的服务端在 `server/` 子目录里，`server.properties`、
+    /// `eula.txt`、`world/` 也都跟着在那边——[`Self::inner_dir`] 负责换算。
+    pub mcdr: bool,
+    /// Bukkit 系分支的名字（`Paper` / `Purpur` / `Folia` / `Spigot` /
+    /// `CraftBukkit`），不是分支就是空串。
+    ///
+    /// 这几个分支的 jar 里一样有 `version.json`，光看核心种类只能认出「原版」，
+    /// 但玩家自己清楚在开 Paper。所以另外翻一遍 jar 里的构件名，**只为贴一枚
+    /// chip**——核心种类、启动命令、配置文件都还是原版那一套。
+    pub flavor: &'static str,
 }
 
 impl Server {
@@ -171,14 +194,44 @@ impl Server {
         }
     }
 
+    /// 真正的服务端文件所在目录。
+    ///
+    /// 普通服务端就是自己；套了 MCDR 的那一层要再往下走一格 `server/`。
+    /// 这个换算只有一处，别在别处手写 `join("server")`——`server/` 这个
+    /// 名字是 MCDR 的约定，将来它改了只该改 [`crate::mcdr::SERVER_SUBDIR`]。
+    pub fn inner_dir(&self) -> PathBuf {
+        if self.mcdr {
+            crate::mcdr::inner_dir(&self.dir)
+        } else {
+            self.dir.clone()
+        }
+    }
+
     pub fn properties_path(&self) -> PathBuf {
-        self.dir.join("server.properties")
+        self.inner_dir().join("server.properties")
     }
 
     pub fn eula_path(&self) -> PathBuf {
-        self.dir.join("eula.txt")
+        self.inner_dir().join("eula.txt")
     }
 
+    /// 这一份的配置**文件**在哪。
+    ///
+    /// 普通服务端是 `server.properties`；代理端没有那个文件，配置在
+    /// `velocity.toml` 里。「打开源文件」按这个走，不然点下去会找一个
+    /// 根本不会存在的路径。
+    pub fn config_path(&self) -> PathBuf {
+        if self.core == CoreKind::Velocity {
+            self.dir.join("velocity.toml")
+        } else {
+            self.properties_path()
+        }
+    }
+
+    /// 玩家双击的那个脚本。
+    ///
+    /// MCDR 的启动脚本在**外层**（它拉起来的是 MCDR，不是 Java），
+    /// 普通服务端的就在自己目录里。
     pub fn start_script(&self) -> PathBuf {
         self.dir.join("start.bat")
     }
@@ -197,14 +250,18 @@ pub fn root() -> PathBuf {
 /// 只认带 [`MARKER`] 的目录：`servers/` 下可能有玩家自己放的东西，
 /// 或者装到一半失败留下的半成品，那些不该出现在列表里。
 pub fn list() -> Vec<Server> {
-    list_with(&[])
+    list_with(&[], &[])
 }
 
 /// 同上，另外把玩家自己加进来的目录也算上。
 ///
 /// 那些目录不归我们管：可能是在别处开了一年多的老服，整个文件夹搬过来
 /// 接着用。它们没有 [`MARKER`]，靠 [`probe`] 现场认核心。
-pub fn list_with(extra: &[PathBuf]) -> Vec<Server> {
+///
+/// `hidden` 是玩家从列表里移除掉的目录（见 `Settings::hidden_server_dirs`）。
+/// 「移除」不是删除——磁盘一个字节都不动，只是不想在界面上看见它，
+/// 所以这里得照着这份名单过滤，否则下次扫描它又冒出来了。
+pub fn list_with(extra: &[PathBuf], hidden: &[String]) -> Vec<Server> {
     let mut out: Vec<Server> = std::fs::read_dir(root())
         .map(|entries| {
             entries
@@ -215,7 +272,9 @@ pub fn list_with(extra: &[PathBuf]) -> Vec<Server> {
         })
         .unwrap_or_default();
     for dir in extra {
-        let Some(server) = probe(dir) else {
+        // 用 `probe_any` 而不是 `probe`：玩家刚选过的目录一定要在列表里出现，
+        // 哪怕里面空得连个 jar 都没有——他得看得见自己选的是什么。
+        let Some(server) = probe_any(dir) else {
             continue;
         };
         // `servers/` 下那份已经算过了，别重复列一遍
@@ -223,6 +282,15 @@ pub fn list_with(extra: &[PathBuf]) -> Vec<Server> {
             continue;
         }
         out.push(server);
+    }
+    // 隐藏名单最后统一过滤：`servers/` 下我们自己装的那些也走这条路，
+    // 玩家不想看见它，不代表想删掉他的存档。
+    if !hidden.is_empty() {
+        out.retain(|server| {
+            !hidden
+                .iter()
+                .any(|dir| dir.eq_ignore_ascii_case(&server.dir.to_string_lossy()))
+        });
     }
     out.sort_by_key(|server| server.name.to_lowercase());
     out
@@ -241,9 +309,18 @@ pub fn read(dir: &Path) -> Option<Server> {
         .get("core")
         .and_then(Json::as_str)
         .and_then(CoreKind::from_id)?;
+    let mcdr = root.get("mcdr").and_then(Json::as_bool).unwrap_or(false);
+    // 套了 MCDR 的，`eula.txt` 在 `server/` 那一层
+    let eula_dir = if mcdr {
+        crate::mcdr::inner_dir(dir)
+    } else {
+        dir.to_path_buf()
+    };
     Some(Server {
-        eula: eula_accepted(dir),
+        eula: eula_accepted(&eula_dir),
         managed: true,
+        recognized: true,
+        mcdr,
         name,
         dir: dir.to_path_buf(),
         core,
@@ -257,6 +334,9 @@ pub fn read(dir: &Path) -> Option<Server> {
             .and_then(Json::as_str)
             .unwrap_or_default()
             .to_string(),
+        // 我们只会装那四种核心，装出来的不会是什么分支；
+        // 玩家后来把 jar 换成 Paper 的话，得等他重启才会重新认。
+        flavor: "",
     })
 }
 
@@ -277,6 +357,16 @@ pub fn read(dir: &Path) -> Option<Server> {
 /// 顺序有讲究：Forge 和 NeoForge 的目录里**也**有一份 `server.jar`（它们
 /// 自己下下来喂给安装器的），先看加载器目录才不会把 Forge 服认成原版。
 pub fn probe(dir: &Path) -> Option<Server> {
+    probe_any(dir).filter(|server| server.recognized)
+}
+
+/// 同上，但认不出核心的目录也留一张「占位」卡片。
+///
+/// 玩家在资源管理器里挑了一个文件夹，我们总得让它在列表里有个位置：
+/// 什么都不显示的话，他刚点完「添加」就看不到任何反应，只会以为没work。
+/// 占位卡片的 `recognized` 是 false，界面据此显示「空目录 / 没认出核心」
+/// 并给一个就地装一个的入口。
+pub fn probe_any(dir: &Path) -> Option<Server> {
     if !dir.is_dir() {
         return None;
     }
@@ -284,6 +374,41 @@ pub fn probe(dir: &Path) -> Option<Server> {
     if let Some(mut server) = read(dir) {
         server.managed = true;
         return Some(server);
+    }
+
+    // 套了 MCDR 的目录：外层的 jar 一个都没有（真服务端在 `server/` 里），
+    // 直接往下探会把整个目录认成「空目录」。所以先认 MCDR，再探内层，
+    // 探到之后把结果搬上来、把 `mcdr` 补成 true。
+    if crate::mcdr::is_mcdr(dir) {
+        if let Some(mut server) = probe_any(&crate::mcdr::inner_dir(dir)) {
+            server.mcdr = true;
+            server.dir = dir.to_path_buf();
+            server.name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("server")
+                .to_string();
+            server.eula = eula_accepted(&crate::mcdr::inner_dir(dir));
+            return Some(server);
+        }
+        // MCDR 骨架在、但 `server/` 里还没有核心：这仍然是个有效目录
+        // （玩家刚建完骨架，或者自己清空了核心），认成「空目录」让他能装。
+        return Some(Server {
+            eula: false,
+            managed: false,
+            recognized: false,
+            mcdr: true,
+            name: dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("server")
+                .to_string(),
+            dir: dir.to_path_buf(),
+            core: CoreKind::Vanilla,
+            mc_version: String::new(),
+            core_version: String::new(),
+            flavor: "",
+        });
     }
 
     // 代理端先认：它的 jar 里没有 `version.json`，落到下面会被当成
@@ -298,30 +423,32 @@ pub fn probe(dir: &Path) -> Option<Server> {
         .and_then(jar_version)
         .unwrap_or_default();
 
-    let (core, core_version) = if let Some(version) = library_version(dir, "net/neoforged/neoforge") {
-        (CoreKind::NeoForge, version)
+    // Paper / Purpur 这些分支的 jar 里也有 `version.json`，上面那一步只会读出版本号。
+    // 想知道它是谁，得再翻一遍 jar 里的构件名。
+    let flavor = jar.as_deref().and_then(bukkit_flavor).unwrap_or("");
+
+    let core = if let Some(version) = library_version(dir, "net/neoforged/neoforge") {
+        Some((CoreKind::NeoForge, version))
     } else if let Some(version) = library_version(dir, "net/minecraftforge/forge") {
         // Forge 的目录名是 `<mc>-<forge>`，我们只要后半截
         let forge = version
             .split_once('-')
             .map(|(_, rest)| rest.to_string())
             .unwrap_or(version);
-        (CoreKind::Forge, forge)
+        Some((CoreKind::Forge, forge))
     } else if let Some(version) = library_version(dir, "net/fabricmc/fabric-loader") {
-        (CoreKind::Fabric, version)
+        Some((CoreKind::Fabric, version))
     } else if dir.join("fabric-server-launch.jar").exists() {
-        (CoreKind::Fabric, String::new())
+        Some((CoreKind::Fabric, String::new()))
     } else if jar.is_some() && !mc_version.is_empty() {
-        (CoreKind::Vanilla, String::new())
-    } else {
+        Some((CoreKind::Vanilla, String::new()))
+    } else if jar.is_some() || has_any_jar(dir) {
         // 有 jar 但读不出版本号：可能是 Purpur / Paper 这类分支，或者是
         // 我们完全不认识的东西。认成原版但留个空版本号，界面上会显示
         // 「原版 · 版本未知」，玩家仍然能配置和开服。
-        let any_jar = jar.is_some() || has_any_jar(dir);
-        if !any_jar {
-            return None;
-        }
-        (CoreKind::Vanilla, String::new())
+        Some((CoreKind::Vanilla, String::new()))
+    } else {
+        None
     };
 
     let name = dir
@@ -329,15 +456,50 @@ pub fn probe(dir: &Path) -> Option<Server> {
         .and_then(|n| n.to_str())
         .unwrap_or("server")
         .to_string();
+    // `recognized` 就是「上面那段判定有没有给出结论」。没有结论时仍然给一个
+    // 原版占位——`core` 处处都是非 Option 的，占位比让整条链路去处理 None 划算。
+    let recognized = core.is_some();
+    let (core, core_version) = core.unwrap_or((CoreKind::Vanilla, String::new()));
     Some(Server {
         eula: eula_accepted(dir),
         managed: false,
+        recognized,
+        mcdr: false,
         name,
         dir: dir.to_path_buf(),
         core,
         mc_version,
         core_version,
+        flavor,
     })
+}
+
+/// 认出 Bukkit 系的哪一个分支。
+///
+/// Paper / Purpur / Folia / Spigot / CraftBukkit 的 jar 里都能读到
+/// `version.json`（Spigot 系除外），所以从版本号那边看不出区别——它们的
+/// 区别在**打了哪些构件**：Paper 打 `io.papermc.paper`，Folia 打 `dev.folia`，
+/// Purpur 在 Paper 的基础上再打 `org.purpurmc`。
+///
+/// 判定顺序有讲究：**Purpur 必须排在 Paper 前面**，它自己的 jar 里也留着
+/// 上游 Paper 的构件，先问 Paper 会把它认成 Paper。
+fn bukkit_flavor(jar: &Path) -> Option<&'static str> {
+    let entries = crate::natives::read_zip_entries(jar).ok()?;
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    let has = |prefix: &str| names.iter().any(|name| name.starts_with(prefix));
+    if has("META-INF/libraries/org/purpurmc/") {
+        Some("Purpur")
+    } else if has("META-INF/libraries/dev/folia/") {
+        Some("Folia")
+    } else if has("META-INF/libraries/io/papermc/paper/") {
+        Some("Paper")
+    } else if has("META-INF/libraries/spigot-api-") {
+        Some("Spigot")
+    } else if has("META-INF/libraries/bukkit-") {
+        Some("CraftBukkit")
+    } else {
+        None
+    }
 }
 
 /// 认代理端（目前只有 Velocity）。
@@ -383,6 +545,9 @@ fn probe_proxy(dir: &Path) -> Option<Server> {
         // 代理端不绑游戏版本，这一栏留空（摘要里也不会显示）。
         mc_version: String::new(),
         core_version: version,
+        recognized: true,
+        mcdr: false,
+        flavor: "",
     })
 }
 
@@ -833,8 +998,15 @@ pub fn name_taken(name: &str) -> bool {
 /// 安装进度。
 #[derive(Debug, Clone)]
 pub enum Progress {
-    /// 正在做什么。
+    /// 正在做什么（查清单、跑安装器这类说不清进度的阶段）。
     Stage(String),
+    /// 正在下一份文件：已下 `got` 字节，这份一共 `total` 字节。
+    ///
+    /// `total` 为 0 表示对方没给长度（安装器那几个就是），界面按「只知道
+    /// 已下多少」显示。
+    Downloading { got: u64, total: u64 },
+    /// 预置安装器依赖的库：`done` / `total` 个文件。
+    Libraries { done: usize, total: usize },
 }
 
 /// 一次安装的全部输入。
@@ -853,6 +1025,15 @@ pub struct Plan {
     pub mirror: crate::settings::Mirror,
     /// 下载限速。
     pub limit_kbps: Option<u32>,
+    /// 要不要套一层 MCDReforged。
+    ///
+    /// 打开之后核心装进 `server/` 子目录，外层生成 MCDR 骨架。迁移已有
+    /// 服务端**不在这里做**——那是另一件事，风险也大得多。
+    pub mcdr: bool,
+    /// 套 MCDR 时要用的 Python 解释器（`mcdr::detect` 探到的那个）。
+    ///
+    /// 不套 MCDR 时忽略。
+    pub python: Option<PathBuf>,
 }
 
 /// 服务器里用哪一份 Java。
@@ -895,7 +1076,7 @@ fn pick_java(plan: &Plan) -> Result<PathBuf, String> {
     }
     if let Some(runtime) = crate::java::pick_java(&runtimes, required) {
         // `javaw.exe` 收不到输出，安装器的错误就看不见了，换成同目录的 java.exe。
-        return Ok(console_java(&runtime.path));
+        return Ok(crate::java::console_java(&runtime.path));
     }
     // 都低于要求时退回版本最高的那个：装不上至少报错能读。
     let newest = runtimes
@@ -903,21 +1084,7 @@ fn pick_java(plan: &Plan) -> Result<PathBuf, String> {
         .max_by_key(|runtime| runtime.major_version)
         .map(|runtime| runtime.path.clone())
         .ok_or_else(|| "本机没找到 Java".to_string())?;
-    Ok(console_java(&newest))
-}
-
-/// `javaw.exe` 收不到输出，跑安装器要换成 `java.exe`。
-fn console_java(path: &Path) -> PathBuf {
-    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    if !name.eq_ignore_ascii_case("javaw.exe") {
-        return path.to_path_buf();
-    }
-    let sibling = path.with_file_name("java.exe");
-    if sibling.is_file() {
-        sibling
-    } else {
-        path.to_path_buf()
-    }
+    Ok(crate::java::console_java(&newest))
 }
 
 /// 装一个服务端。
@@ -982,6 +1149,170 @@ where
     result
 }
 
+/// 往一个已经有东西的目录里装一份核心。
+///
+/// 和 [`create_at`] 的区别只有一条：这里**允许目录非空**。管理页的
+/// 「安装核心」走这条——目录里可能已经有玩家自己放的东西（存档、配置，
+/// 也可能有一份旧核心），所以不能要求空目录。失败时也不删目录：里面的
+/// 东西是玩家的，装失败了顶多是白下一次，不能连带把存档清掉。
+///
+/// 只负责装核心（jar、库、默认配置、启动脚本）。要换核心的话重新走一遍
+/// 这条路即可，但界面已经不提供「换核心」的入口了——那件事收益小、风险大。
+pub fn reinstall<F>(
+    plan: &Plan,
+    dir: &Path,
+    cancel: &crate::cancel::CancelToken,
+    on_progress: &(dyn Fn(Progress) + Send + Sync),
+    mut on_log: F,
+) -> Result<Server, String>
+where
+    F: FnMut(&str),
+{
+    if !dir.is_dir() {
+        return Err(format!("{} 不存在了，换个目录吧", dir.display()));
+    }
+    on_log(&format!(
+        "在 {} 里安装核心：{} {}",
+        dir.display(),
+        plan.core.label(),
+        plan.mc_version
+    ));
+    install_into(plan, dir, cancel, on_progress, &mut on_log)
+}
+
+/// 给一个已经装好核心的目录套上 MCDReforged。
+///
+/// 这一步**不可逆**：核心、库、存档、配置全部被搬进 `server/`，外层从此由
+/// MCDR 接管。想拆回去只能自己打开资源管理器，把 `server/` 里的东西搬回来。
+///
+/// 搬迁只用 `std::fs::rename`。`server/` 就在同一个目录里，**永远不会跨卷**，
+/// 所以这一步是原子且零拷贝的：几 GB 的 `world/` 也是瞬间完成，不会出现
+/// 「搬了一半」的中间态——那正是这件事听起来最吓人的地方。
+///
+/// `aicraft-server.json` 不搬：它描述的是外层这个目录，搬进 `server/` 之后
+/// [`read`] 在外层就找不到它了，列表会把这个服认成空目录。
+pub fn adopt_mcdr<F>(
+    dir: &Path,
+    python: &Path,
+    memory_mb: u32,
+    cancel: &crate::cancel::CancelToken,
+    on_progress: &(dyn Fn(Progress) + Send + Sync),
+    mut on_log: F,
+) -> Result<Server, String>
+where
+    F: FnMut(&str),
+{
+    if !dir.is_dir() {
+        return Err(format!("{} 不存在了，换个目录吧", dir.display()));
+    }
+    if crate::mcdr::is_mcdr(dir) {
+        return Err("这一份已经套过 MCDReforged 了".to_string());
+    }
+    let found = probe_any(dir).ok_or_else(|| "这个目录里没认出服务端核心".to_string())?;
+    if !found.recognized {
+        return Err("这个目录里还没有核心，先装一个再套 MCDR".to_string());
+    }
+    if found.core == CoreKind::Velocity {
+        return Err("代理端不套 MCDReforged".to_string());
+    }
+
+    let inner = crate::mcdr::inner_dir(dir);
+    if inner.exists() {
+        let mut leftovers = std::fs::read_dir(&inner)
+            .map_err(|e| format!("读 {} 失败: {}", inner.display(), e))?;
+        if leftovers.next().is_some() {
+            // 已经有一个不像 MCDR 骨架的 server/：可能是玩家自己的东西，
+            // 往上叠会把两层混成一锅。
+            return Err(format!(
+                "{} 里已经有东西了，先清理掉再套 MCDR",
+                inner.display()
+            ));
+        }
+    }
+    std::fs::create_dir_all(&inner).map_err(|e| format!("建 {} 失败: {}", inner.display(), e))?;
+
+    on_progress(Progress::Stage("把服务端搬进 server/".to_string()));
+    let moved = move_into(dir, &inner, cancel, &mut on_log)?;
+    on_log(&format!("搬了 {} 项进 server/", moved));
+
+    let plan = Plan {
+        name: found.name.clone(),
+        core: found.core,
+        mc_version: found.mc_version.clone(),
+        core_version: found.core_version.clone(),
+        memory_mb,
+        java: None,
+        mirror: crate::settings::Mirror::Official,
+        limit_kbps: None,
+        mcdr: true,
+        python: Some(python.to_path_buf()),
+    };
+
+    on_progress(Progress::Stage("生成 MCDR 骨架".to_string()));
+    // 内层那份 start.bat 现在在 server/ 里，重写一遍保证 -Xmx 与 java 路径是新的。
+    write_start_script(&plan, &inner, &mut on_log)?;
+    let handler = crate::mcdr::handler_for(plan.core);
+    crate::mcdr::create_skeleton(dir, &mcdr_start_command(&plan), handler, "zh_cn")?;
+    crate::mcdr::write_start_bat(dir, python)?;
+    write_marker(&plan, dir, true)?;
+
+    let server = read(dir).ok_or_else(|| "写完元数据读不回来".to_string())?;
+    on_log("MCDReforged 已就位，双击 start.bat 开服（那个窗口别关）");
+    Ok(server)
+}
+
+/// 把 `dir` 顶层的每一项搬进 `inner`，返回搬了几项。
+///
+/// 只认 `std::fs::rename`：两个目录互为父子，一定在同一个卷上，所以这一步
+/// 是原子的。真遇到跨卷（不可能是这里）就直接报错，**绝不**退化成「复制
+/// 一半再删源」——那才是会毁存档的做法。
+fn move_into<F>(
+    dir: &Path,
+    inner: &Path,
+    cancel: &crate::cancel::CancelToken,
+    on_log: &mut F,
+) -> Result<usize, String>
+where
+    F: FnMut(&str),
+{
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("读 {} 失败: {}", dir.display(), e))?;
+    let mut moved = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读 {} 失败: {}", dir.display(), e))?;
+        if cancel.is_cancelled() {
+            return Err("已取消".to_string());
+        }
+        let name = entry.file_name();
+        // 元数据描述的是外层这个目录，跟着搬进去就再也找不回来了。
+        if name == MARKER {
+            continue;
+        }
+        let source = entry.path();
+        // `server/` 自己不能搬进自己。
+        if source == inner {
+            continue;
+        }
+        let dest = inner.join(&name);
+        if dest.exists() {
+            return Err(format!(
+                "{} 里已经有一个同名的 {} 了",
+                inner.display(),
+                name.to_string_lossy()
+            ));
+        }
+        std::fs::rename(&source, &dest).map_err(|e| {
+            format!(
+                "把 {} 搬进 server/ 失败: {}（服务端是不是还开着？先把窗口关掉）",
+                name.to_string_lossy(),
+                e
+            )
+        })?;
+        on_log(&format!("搬了 {}", name.to_string_lossy()));
+        moved += 1;
+    }
+    Ok(moved)
+}
+
 fn install_into<F>(
     plan: &Plan,
     dir: &Path,
@@ -992,36 +1323,83 @@ fn install_into<F>(
 where
     F: FnMut(&str),
 {
+    // 套 MCDR 的话，核心装在 `server/` 子目录里——MCDR 把它自己的东西
+    // 摆在外层，把服务端关进 `server/`，这个分层是它的约定。
+    let inner = if plan.mcdr {
+        let path = crate::mcdr::inner_dir(dir);
+        std::fs::create_dir_all(&path).map_err(|e| format!("建 {} 失败: {}", path.display(), e))?;
+        path
+    } else {
+        dir.to_path_buf()
+    };
+    let target = inner.as_path();
+
     match plan.core {
-        CoreKind::Vanilla => install_vanilla(plan, dir, cancel, on_progress, on_log)?,
-        CoreKind::Fabric => install_fabric(plan, dir, cancel, on_progress, on_log)?,
+        CoreKind::Vanilla => install_vanilla(plan, target, cancel, on_progress, on_log)?,
+        CoreKind::Fabric => install_fabric(plan, target, cancel, on_progress, on_log)?,
         CoreKind::Forge | CoreKind::NeoForge => {
-            install_installer_core(plan, dir, cancel, on_progress, on_log)?
+            install_installer_core(plan, target, cancel, on_progress, on_log)?
         }
         CoreKind::Velocity => {
             return Err("Velocity 是代理端，启动器目前只识别它，不替你安装。".to_string())
         }
     }
 
-    // 装完立刻铺一份默认配置：Minecraft 只在第一次启动时才生成，而玩家多半
-    // 想在开服之前就把 motd、端口定好。
-    let props_path = dir.join("server.properties");
-    if !props_path.exists() {
-        let mut props = Properties::default();
-        for field in FIELDS {
-            props.set(field.key, field.default);
-        }
-        props.save(&props_path)?;
+    // **不**替服务端铺 server.properties：那份文件归 Minecraft 自己，
+    // 第一次启动时才生成。启动器凭空造一份，等于替玩家决定了端口、难度、
+    // 种子这一串他从没选过的东西；而且我们自己写的那份只有 FIELDS 里
+    // 列出的十几个键，剩下四十来个全缺，读起来像一份「被删过」的配置。
+    // 等它真的生成出来，界面再出现「服务器配置」那一节。
+    if !target.join("eula.txt").exists() {
+        set_eula(target, false)?;
     }
-    if !dir.join("eula.txt").exists() {
-        set_eula(dir, false)?;
+
+    if plan.mcdr {
+        // 先写内层的启动脚本（`start_command` 要照着它抄），再建骨架。
+        // 顺序反了的话，骨架里的 `start_command` 只能写成占位符。
+        write_start_script(plan, target, on_log)?;
+        let python = plan
+            .python
+            .as_deref()
+            .ok_or_else(|| "套 MCDR 要一个 Python，没探测到".to_string())?;
+        let handler = crate::mcdr::handler_for(plan.core);
+        crate::mcdr::create_skeleton(dir, &mcdr_start_command(plan), handler, "zh_cn")?;
+        crate::mcdr::write_start_bat(dir, python)?;
+        on_log("MCDR 骨架已就位，双击 start.bat 开服（那个窗口别关）");
+    } else {
+        write_start_script(plan, dir, on_log)?;
     }
-    write_start_script(plan, dir, on_log)?;
-    write_marker(plan, dir)?;
+
+    write_marker(plan, dir, plan.mcdr)?;
 
     let server = read(dir).ok_or_else(|| "写完元数据读不回来".to_string())?;
     on_log(&format!("服务端就绪：servers/{}", plan.name));
     Ok(server)
+}
+
+/// MCDR 的 `start_command`：它在 `server/` 里起核心。
+///
+/// 和 `start.bat` 里那一行必须一致，但**不能共用**——脚本是给人看的
+/// 双击入口，这一行是 MCDR 自己偷偷起的。两边各写一遍，改一处忘另一处
+/// 就会「双击能开、MCDR 起不来」。
+fn mcdr_start_command(plan: &Plan) -> String {
+    let java = match pick_java(plan) {
+        Ok(path) => path.display().to_string(),
+        Err(_) => "java".to_string(),
+    };
+    let memory = plan.memory_mb.max(512);
+    match plan.core {
+        CoreKind::Forge | CoreKind::NeoForge => "cmd /c run.bat nogui".to_string(),
+        CoreKind::Fabric => format!(
+            "\"{}\" -Xmx{}M -Dfile.encoding=UTF-8 -jar fabric-server-launch.jar nogui",
+            java, memory
+        ),
+        CoreKind::Vanilla => format!(
+            "\"{}\" -Xmx{}M -Dfile.encoding=UTF-8 -jar server.jar nogui",
+            java, memory
+        ),
+        CoreKind::Velocity => format!("\"{}\" -Xmx{}M -jar velocity.jar", java, memory),
+    }
 }
 
 /// 原版：Mojang 的版本 JSON 里直接给 `downloads.server`。
@@ -1121,10 +1499,12 @@ where
     download_with_fallback(
         &server.url,
         &dest,
+        server.size.unwrap_or(0),
         server.sha1.as_deref(),
         plan.limit_kbps,
         cancel,
         plan.mirror,
+        on_progress,
         on_log,
     )?;
     Ok(())
@@ -1134,13 +1514,16 @@ where
 ///
 /// 六十多兆的 server.jar 走 BMCLAPI 时经常在几千字节处被对端重置
 /// （curl 退出码 35）——它自己的重试兜不住大文件，这里换条路再来一次。
+#[allow(clippy::too_many_arguments)]
 fn download_with_fallback<F>(
     url: &str,
     dest: &Path,
+    total_hint: u64,
     sha1: Option<&str>,
     limit_kbps: Option<u32>,
     cancel: &crate::cancel::CancelToken,
     mirror: crate::settings::Mirror,
+    on_progress: &(dyn Fn(Progress) + Send + Sync),
     on_log: &mut F,
 ) -> Result<(), String>
 where
@@ -1156,24 +1539,83 @@ where
     let total = candidates.len();
     let mut last = String::new();
     for (index, candidate) in candidates.into_iter().enumerate() {
-        match crate::transport::download_with_cancel(
+        match download_watched(
             &candidate,
             dest,
+            total_hint,
             sha1,
             limit_kbps,
             cancel,
+            on_progress,
         ) {
-            Ok(_) => return Ok(()),
-            Err(e) if e.is_cancelled() => return Err("已取消".to_string()),
+            Ok(()) => return Ok(()),
+            Err(e) if e == CANCELED => return Err(e),
             Err(e) => {
-                last = e.to_string();
+                last = e;
                 if index + 1 < total {
-                    on_log(&format!("镜像上没下下来（{}），换官方地址再试一次", e));
+                    on_log(&format!("镜像上没下下来（{}），换官方地址再试一次", last));
                 }
             }
         }
     }
     Err(format!("下载 {} 失败: {}", dest.display(), last))
+}
+
+/// 取消时返回的固定文案，调用方靠它区分「失败」和「玩家自己停的」。
+const CANCELED: &str = "已取消";
+
+/// 下一份文件，同时旁路报告进度。
+///
+/// `transport::download_with_cancel` 是同步的、而且内部只有 `.part` 文件在长，
+/// 不对外说话。所以这里起一个每 200ms 看一眼 `.part` 长度的线程——和
+/// `crate::javadl` 里那套是同一个办法：**已下的字节数只有文件系统知道**，
+/// 让 curl 自己吐进度得改传输层，那层还被游戏下载和模组下载共用着。
+#[allow(clippy::too_many_arguments)]
+fn download_watched(
+    url: &str,
+    dest: &Path,
+    total_hint: u64,
+    sha1: Option<&str>,
+    limit_kbps: Option<u32>,
+    cancel: &crate::cancel::CancelToken,
+    on_progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<(), String> {
+    let part = part_path(dest);
+    let done = AtomicBool::new(false);
+    let result = std::thread::scope(|scope| {
+        // 用 scope 而不是 `spawn`：`on_progress` 是个 `&dyn Fn` 借用，
+        // 自由线程要求 `'static`，作用域线程能在函数体里安全地借它。
+        scope.spawn(|| {
+            let mut last = u64::MAX;
+            while !done.load(Ordering::Relaxed) {
+                let got = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                if got != last {
+                    on_progress(Progress::Downloading {
+                        got,
+                        total: total_hint,
+                    });
+                    last = got;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let result = crate::transport::download_with_cancel(url, dest, sha1, limit_kbps, cancel);
+        done.store(true, Ordering::Relaxed);
+        result
+    });
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) if e.is_cancelled() => Err(CANCELED.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `download_with_cancel` 的临时文件名规则，和它保持一致。
+fn part_path(dest: &Path) -> PathBuf {
+    let mut s = dest.as_os_str().to_os_string();
+    s.push(".part");
+    PathBuf::from(s)
 }
 
 /// Fabric：官方安装器的 `server` 子命令。
@@ -1203,20 +1645,22 @@ where
     let mut last_error = String::new();
     for candidate in candidates {
         on_log(&format!("下载 Fabric 安装器：{}", candidate));
-        match crate::transport::download_with_cancel(
+        match download_watched(
             &candidate,
             &installer,
+            0,
             None,
             plan.limit_kbps,
             cancel,
+            on_progress,
         ) {
-            Ok(_) => {
+            Ok(()) => {
                 last_error.clear();
                 break;
             }
             Err(e) => {
-                if e.is_cancelled() {
-                    return Err("已取消".to_string());
+                if e == CANCELED {
+                    return Err(e);
                 }
                 last_error = format!("{}: {}", candidate, e);
             }
@@ -1296,15 +1740,14 @@ where
     let mut last_error = String::new();
     for url in installer_urls(plan) {
         on_log(&format!("下载 {} 安装器：{}", plan.core.label(), url));
-        match crate::transport::download_with_cancel(&url, &installer, None, plan.limit_kbps, cancel)
-        {
-            Ok(_) => {
+        match download_watched(&url, &installer, 0, None, plan.limit_kbps, cancel, on_progress) {
+            Ok(()) => {
                 last_error.clear();
                 break;
             }
             Err(e) => {
-                if e.is_cancelled() {
-                    return Err("已取消".to_string());
+                if e == CANCELED {
+                    return Err(e);
                 }
                 last_error = format!("{}: {}", url, e);
             }
@@ -1331,9 +1774,16 @@ where
     } else {
         "官方源"
     };
-    // 预置阶段的进度条走 loader 那套 `LoaderProgress`，这里只把「在忙什么」
-    // 转出来；逐条下载的细进度不值得占一行。
-    let progress = |_p: crate::loader::LoaderProgress| {};
+    // 预置阶段要下一百多个库，光转一句「在忙什么」会让人以为卡死了；
+    // 转成 `Progress::Libraries` 让界面能画「已下 42 / 135 个库」。
+    let progress = |p: crate::loader::LoaderProgress| match p {
+        crate::loader::LoaderProgress::Tick { done, total, .. } => {
+            on_progress(Progress::Libraries { done, total });
+        }
+        crate::loader::LoaderProgress::Working(text) => {
+            on_progress(Progress::Stage(text));
+        }
+    };
     crate::loader::preseed_installer_libraries(
         dir,
         &installer,
@@ -1532,13 +1982,14 @@ fn tail_of(path: &Path, lines: usize) -> String {
 }
 
 /// 写元数据。
-fn write_marker(plan: &Plan, dir: &Path) -> Result<(), String> {
+fn write_marker(plan: &Plan, dir: &Path, mcdr: bool) -> Result<(), String> {
     let text = format!(
-        "{{\n  \"name\": \"{}\",\n  \"core\": \"{}\",\n  \"mc_version\": \"{}\",\n  \"core_version\": \"{}\"\n}}\n",
+        "{{\n  \"name\": \"{}\",\n  \"core\": \"{}\",\n  \"mc_version\": \"{}\",\n  \"core_version\": \"{}\",\n  \"mcdr\": {}\n}}\n",
         crate::auth::json_escape(&plan.name),
         plan.core.id(),
         crate::auth::json_escape(&plan.mc_version),
         crate::auth::json_escape(&plan.core_version),
+        mcdr,
     );
     std::fs::write(dir.join(MARKER), text).map_err(|e| format!("写元数据失败: {}", e))
 }
@@ -1680,6 +2131,126 @@ mod tests {
         out.extend_from_slice(name);
         out.extend_from_slice(data);
         std::fs::write(path, out).unwrap();
+    }
+
+    /// 造一个带中央目录的 ZIP，条目名照抄进来、内容为空。
+    ///
+    /// `fake_packer_jar` 那种只有本地文件头的包，`read_zip_entries` 找 EOCD 会失败——
+    /// 认分支靠的正是条目名列表，所以这里得造个结构完整的。
+    fn fake_zip(path: &Path, entries: &[&str]) {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for name in entries {
+            let name_bytes = name.as_bytes();
+            let offset = out.len() as u32;
+            out.extend_from_slice(b"PK\x03\x04");
+            out.extend_from_slice(&[20, 0, 0, 0, 0, 0]);
+            out.extend_from_slice(&[0, 0, 0, 0]); // time/date
+            out.extend_from_slice(&[0, 0, 0, 0]); // crc
+            out.extend_from_slice(&[0, 0, 0, 0]); // compressed
+            out.extend_from_slice(&[0, 0, 0, 0]); // uncompressed
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(&[0, 0]); // extra
+            out.extend_from_slice(name_bytes);
+
+            central.extend_from_slice(b"PK\x01\x02");
+            central.extend_from_slice(&[20, 0, 20, 0]); // 制作者版本 / 需要版本
+            central.extend_from_slice(&[0, 0]); // 标志
+            central.extend_from_slice(&[0, 0]); // 压缩方式
+            central.extend_from_slice(&[0, 0]); // 时间
+            central.extend_from_slice(&[0, 0]); // 日期
+            central.extend_from_slice(&[0, 0, 0, 0]); // crc（我们不校验）
+            central.extend_from_slice(&[0, 0, 0, 0]); // 压缩后大小
+            central.extend_from_slice(&[0, 0, 0, 0]); // 原始大小
+            central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            central.extend_from_slice(&[0, 0]); // 扩展字段长度
+            central.extend_from_slice(&[0, 0]); // 注释长度
+            central.extend_from_slice(&[0, 0]); // 起始磁盘
+            central.extend_from_slice(&[0, 0]); // 内部属性
+            central.extend_from_slice(&[0, 0, 0, 0]); // 外部属性
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+        let cd_offset = out.len() as u32;
+        let cd_size = central.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn each_bukkit_fork_is_recognised_by_its_own_artifact() {
+        let dir = crate::testutil::fresh_dir("server-flavors");
+        let cases: [(&str, &[&str], Option<&str>); 6] = [
+            (
+                "paper",
+                &[
+                    "version.json",
+                    "META-INF/libraries/io/papermc/paper/paper-api/1.21.8/a.jar",
+                ],
+                Some("Paper"),
+            ),
+            (
+                "purpur",
+                &[
+                    "version.json",
+                    "META-INF/libraries/org/purpurmc/purpur/purpur-api/1.20.4/a.jar",
+                    "META-INF/libraries/io/papermc/paper/paper-mojangapi/1.20.4/a.jar",
+                ],
+                Some("Purpur"),
+            ),
+            (
+                "folia",
+                &[
+                    "version.json",
+                    "META-INF/libraries/dev/folia/folia-api/1.21.8/a.jar",
+                ],
+                Some("Folia"),
+            ),
+            (
+                "spigot",
+                &[
+                    "META-INF/libraries/spigot-api-1.20.1-R0.1-SNAPSHOT.jar",
+                    "META-INF/versions/spigot-1.20.1-R0.1-SNAPSHOT.jar",
+                ],
+                Some("Spigot"),
+            ),
+            (
+                "craftbukkit",
+                &[
+                    "META-INF/libraries/bukkit-1.20.1-R0.1-SNAPSHOT.jar",
+                    "META-INF/versions/craftbukkit-1.20.1-R0.1-SNAPSHOT.jar",
+                ],
+                Some("CraftBukkit"),
+            ),
+            ("vanilla", &["version.json", "net/minecraft/server/Main.class"], None),
+        ];
+        for (label, entries, want) in cases {
+            let jar = dir.join(format!("{label}.jar"));
+            fake_zip(&jar, entries);
+            assert_eq!(bukkit_flavor(&jar), want, "{label} 认错了");
+        }
+    }
+
+    #[test]
+    fn a_purpur_jar_that_also_carries_paper_is_still_purpur() {
+        // Purpur 的 jar 里留着上游 Paper 的构件，判序错了会被认成 Paper。
+        let dir = crate::testutil::fresh_dir("server-purpur-order");
+        let jar = dir.join("purpur.jar");
+        fake_zip(
+            &jar,
+            &[
+                "META-INF/libraries/io/papermc/paper/paper-api/1.20.4/a.jar",
+                "META-INF/libraries/org/purpurmc/purpur/purpur-api/1.20.4/a.jar",
+            ],
+        );
+        assert_eq!(bukkit_flavor(&jar), Some("Purpur"));
     }
 
     #[test]
@@ -1838,6 +2409,20 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_we_cannot_read_still_gets_a_placeholder() {
+        let dir = crate::testutil::fresh_dir("server-probe-placeholder");
+        // `probe` 说「这不是服务端」，但 `probe_any` 得留一张卡片，
+        // 否则玩家刚选了这个文件夹，列表里什么都看不到。
+        let server = probe_any(&dir).expect("空文件夹也要占一行");
+        assert!(!server.recognized);
+        assert_eq!(server.core, CoreKind::Vanilla, "占位仍然给一个能用的 core");
+        assert_eq!(server.mc_version, "");
+        assert_eq!(server.dir, dir.as_ref());
+        // 不存在的目录连占位都不给
+        assert!(probe_any(&dir.join("nope")).is_none());
+    }
+
+    #[test]
     fn a_summary_says_what_would_run() {
         let server = Server {
             name: "survival".to_string(),
@@ -1847,6 +2432,9 @@ mod tests {
             core_version: "0.20.1".to_string(),
             eula: false,
             managed: true,
+            recognized: true,
+            mcdr: false,
+            flavor: "",
         };
         assert_eq!(server.summary(), "Fabric 0.20.1 · 26.3");
         let vanilla = Server {
@@ -1863,6 +2451,9 @@ mod tests {
             core_version: "0.20.1".to_string(),
             eula: false,
             managed: true,
+            recognized: true,
+            mcdr: false,
+            flavor: "",
         };
         assert_eq!(unknown.summary(), "Fabric 0.20.1 · 版本未知");
     }
@@ -1907,6 +2498,8 @@ mod tests {
             java: None,
             mirror,
             limit_kbps: None,
+            mcdr: false,
+            python: None,
         }
     }
 
@@ -1958,5 +2551,152 @@ mod tests {
         // 别的主机原样返回，不能瞎换
         let other = "https://example.com/a.jar";
         assert_eq!(swap_maven(other, crate::loader::BMCLAPI_MAVEN), other);
+    }
+
+    // ------------------------------------------------------------ MCDR
+
+    #[test]
+    fn an_mcdr_directory_is_read_with_its_core_inside() {
+        let dir = crate::testutil::fresh_dir("srv-mcdr-probe");
+        let root = dir.as_ref();
+        // 手搓一个「套了 MCDR 的 Fabric 服」：外层是 MCDR 的骨架，
+        // 真服务端和它的 libraries/ 都在 server/ 里。
+        crate::mcdr::create_skeleton(root, "java -jar x.jar", "vanilla_handler", "zh_cn")
+            .unwrap();
+        let inner = crate::mcdr::inner_dir(root);
+        std::fs::create_dir_all(inner.join("libraries/net/fabricmc/fabric-loader/0.16.10"))
+            .unwrap();
+        std::fs::write(inner.join("fabric-server-launch.jar"), b"fake").unwrap();
+
+        let server = probe_any(root).expect("MCDR 目录要能被认出来");
+        assert!(server.mcdr, "要标成 MCDR");
+        assert!(server.recognized);
+        assert_eq!(server.core, CoreKind::Fabric);
+        assert_eq!(server.core_version, "0.16.10");
+        // 目录指向外层——玩家看到的是他加进来的那个文件夹
+        assert_eq!(server.dir, root);
+        // 但配置与 EULA 要从 server/ 里找
+        assert_eq!(server.properties_path(), inner.join("server.properties"));
+        assert_eq!(server.eula_path(), inner.join("eula.txt"));
+        assert_eq!(server.start_script(), root.join("start.bat"));
+    }
+
+    #[test]
+    fn an_mcdr_folder_with_an_empty_server_dir_is_still_listed() {
+        let dir = crate::testutil::fresh_dir("srv-mcdr-empty");
+        let root = dir.as_ref();
+        crate::mcdr::create_skeleton(root, "java -jar x.jar", "vanilla_handler", "zh_cn")
+            .unwrap();
+
+        let server = probe_any(root).expect("骨架在就得显示");
+        assert!(server.mcdr);
+        assert!(!server.recognized, "server/ 里没核心，得说没认出来");
+    }
+
+    #[test]
+    fn adopting_moves_everything_but_the_marker() {
+        // 这一步不可逆，所以先确认「搬什么、不搬什么」是对的：
+        // `aicraft-server.json` 必须留在外层，否则列表认不出这个服了。
+        let dir = crate::testutil::fresh_dir("adopt-move");
+        let root = dir.as_ref();
+        std::fs::write(root.join("server.jar"), b"jar").unwrap();
+        std::fs::write(root.join("server.properties"), b"motd=x").unwrap();
+        std::fs::write(root.join("eula.txt"), b"eula=true").unwrap();
+        std::fs::write(root.join(MARKER), b"{}").unwrap();
+        std::fs::create_dir_all(root.join("world/region")).unwrap();
+        std::fs::write(root.join("world/region/r.0.0.mca"), b"chunk").unwrap();
+        let inner = crate::mcdr::inner_dir(root);
+        std::fs::create_dir_all(&inner).unwrap();
+
+        let cancel = crate::cancel::CancelToken::new();
+        let moved = move_into(root, &inner, &cancel, &mut |_| {}).unwrap();
+        assert_eq!(moved, 4, "jar / properties / eula / world，元数据不算");
+        assert!(inner.join("server.jar").is_file());
+        assert!(inner.join("world/region/r.0.0.mca").is_file());
+        assert!(root.join(MARKER).is_file(), "元数据要留在外层");
+        assert!(!root.join("server.jar").exists(), "搬完源不能还在");
+    }
+
+    #[test]
+    fn adopting_refuses_to_merge_into_a_used_server_folder() {
+        // `server/` 里已经有玩家自己的东西时不能往上叠——两层混在一起之后
+        // 谁都说不清哪个是哪个。
+        let dir = crate::testutil::fresh_dir("adopt-clash");
+        let root = dir.as_ref();
+        std::fs::write(root.join("server.jar"), b"jar").unwrap();
+        let inner = crate::mcdr::inner_dir(root);
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("server.jar"), b"other").unwrap();
+
+        let cancel = crate::cancel::CancelToken::new();
+        let error = move_into(root, &inner, &cancel, &mut |_| {}).unwrap_err();
+        assert!(error.contains("已经有一个同名的"), "实际：{error}");
+        // 失败时源目录必须原样保留，一个字节都不能丢。
+        assert!(root.join("server.jar").is_file());
+    }
+
+    #[test]
+    fn an_empty_folder_cannot_be_adopted() {
+        let dir = crate::testutil::fresh_dir("adopt-empty");
+        let error = adopt_mcdr(
+            dir.as_ref(),
+            Path::new(r"C:\Python\python.exe"),
+            2048,
+            &crate::cancel::CancelToken::new(),
+            &|_| {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("还没有核心"), "实际：{error}");
+    }
+
+    #[test]
+    fn the_config_file_is_named_after_the_core() {
+        // 代理端没有 `server.properties`，配置在 `velocity.toml` 里；
+        // 「打开源文件」指错地方的话，点下去只会找一个不存在的路径。
+        let mut server = Server {
+            dir: PathBuf::from(r"E:\srv\proxy"),
+            name: "proxy".to_string(),
+            core: CoreKind::Vanilla,
+            mc_version: "1.20.1".to_string(),
+            core_version: String::new(),
+            mcdr: false,
+            flavor: "",
+            eula: false,
+            recognized: true,
+            managed: true,
+        };
+        assert_eq!(
+            server.config_path(),
+            PathBuf::from(r"E:\srv\proxy\server.properties")
+        );
+
+        server.core = CoreKind::Velocity;
+        assert_eq!(
+            server.config_path(),
+            PathBuf::from(r"E:\srv\proxy\velocity.toml")
+        );
+
+        // 套了 MCDR 的服，`server.properties` 在 `server/` 那一层。
+        server.core = CoreKind::Fabric;
+        server.mcdr = true;
+        assert_eq!(
+            server.config_path(),
+            PathBuf::from(r"E:\srv\proxy\server\server.properties")
+        );
+    }
+
+    #[test]
+    fn a_plain_folder_is_not_mistaken_for_mcdr() {
+        let dir = crate::testutil::fresh_dir("srv-not-mcdr");
+        let root = dir.as_ref();
+        std::fs::create_dir_all(root).unwrap();
+        // 只有 config.yml、没有 permission.yml：MCDR 自己也不认这种目录
+        std::fs::write(root.join("config.yml"), "language: zh_cn\n").unwrap();
+        std::fs::write(root.join("server.jar"), b"fake").unwrap();
+
+        let server = probe_any(root).unwrap();
+        assert!(!server.mcdr);
+        assert_eq!(server.properties_path(), root.join("server.properties"));
     }
 }

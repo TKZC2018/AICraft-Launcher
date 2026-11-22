@@ -49,6 +49,25 @@ pub fn recommended_mb(total_mb: u64) -> u32 {
     rounded.clamp(1024, 8192) as u32
 }
 
+/// 一份设置里声明的堆大小，自动模式下换成按本机内存现算的值。
+///
+/// 全局设置（[\`crate::settings::Settings\`]）和单个实例的设置
+/// （[\`crate::instancecfg::InstanceConfig\`]）各自有一对
+/// `auto_memory` / `max_memory_mb` 字段，取值规则一模一样 —— 规则留在这里
+/// 一份，两边都调它，免得哪天改了推荐算法只改了一半。
+///
+/// 还没探到本机内存时退回手动那个值：宁可给一个玩家自己填过的数，
+/// 也不要在「还没量完」的窗口里给出 0。
+pub fn effective_mb(auto_memory: bool, max_memory_mb: u32) -> u32 {
+    if !auto_memory {
+        return max_memory_mb;
+    }
+    match cached() {
+        Some(memory) => recommended_mb(memory.total_mb),
+        None => max_memory_mb,
+    }
+}
+
 static CACHE: OnceLock<Option<Memory>> = OnceLock::new();
 
 /// 进程内缓存的内存快照。

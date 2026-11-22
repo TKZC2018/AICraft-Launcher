@@ -66,11 +66,7 @@ pub fn offline_uuid(username: &str) -> String {
     let mut bytes = digest;
     bytes[6] = (bytes[6] & 0x0F) | 0x30;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
-    let mut out = String::with_capacity(32);
-    for b in bytes {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
+    crate::hex::to_hex(&bytes)
 }
 
 /// 精简 MD5 实现（RFC 1321），仅用于生成离线 UUID。
@@ -180,6 +176,14 @@ pub struct LaunchConfig {
     pub injected_jvm_args: Vec<String>,
     /// 额外游戏参数。
     pub extra_game_args: Vec<String>,
+    /// 游戏窗口宽度（像素）。None 表示交给游戏自己决定。
+    pub window_width: Option<u32>,
+    /// 游戏窗口高度（像素）。
+    pub window_height: Option<u32>,
+    /// 以独占全屏启动（对应 `--fullscreen`）。
+    ///
+    /// 这个参数不在任何一份版本清单里 —— 官方启动器是自己补的，我们照做。
+    pub fullscreen: bool,
     /// 启动器名称，用于 -Dminecraft.launcher.brand。
     pub launcher_name: String,
     pub launcher_version: String,
@@ -202,6 +206,9 @@ impl LaunchConfig {
             extra_jvm_args: Vec::new(),
             injected_jvm_args: Vec::new(),
             extra_game_args: Vec::new(),
+            window_width: None,
+            window_height: None,
+            fullscreen: false,
             launcher_name: "AICraft Launcher".to_string(),
             launcher_version: env!("CARGO_PKG_VERSION").to_string(),
         }
@@ -288,8 +295,15 @@ pub fn build_plan(
     account: &Account,
     config: &LaunchConfig,
 ) -> LaunchPlan {
+    // 只有明确要给窗口尺寸时才打开 `has_custom_resolution`：这一位决定
+    // 清单里 `--width/--height` 那一条要不要展开（1.6 之后每个版本都带它）。
+    let window = match (config.window_width, config.window_height) {
+        (Some(w), Some(h)) => Some((w.max(1), h.max(1))),
+        _ => None,
+    };
     let features = Features {
         is_demo_user: account.demo,
+        has_custom_resolution: window.is_some(),
         ..Features::default()
     };
     let ctx = RuleContext::new(OsInfo::detect(), features);
@@ -343,8 +357,14 @@ pub fn build_plan(
     vars.insert("auth_xuid", String::new());
     vars.insert("user_properties", "{}".to_string());
     // 分辨率等可选参数，未显式指定时留空
-    vars.insert("resolution_width", String::new());
-    vars.insert("resolution_height", String::new());
+    vars.insert(
+        "resolution_width",
+        window.map(|(w, _)| w.to_string()).unwrap_or_default(),
+    );
+    vars.insert(
+        "resolution_height",
+        window.map(|(_, h)| h.to_string()).unwrap_or_default(),
+    );
     vars.insert("game_assets", path_str(&config.assets_dir.join("virtual").join(&version.asset_index.id)));
     vars.insert(
         "assets_index_name_legacy",
@@ -444,6 +464,24 @@ pub fn build_plan(
     if !game_args.iter().any(|a| a == "--assetIndex") && !version.asset_index.id.is_empty() {
         game_args.push("--assetIndex".to_string());
         game_args.push(version.asset_index.id.clone());
+    }
+
+    // 老清单（1.6 之前）里没有 `--width/--height` 那一条，`has_custom_resolution`
+    // 也就无处可展开。这种情况下自己补一对，让「按指定尺寸开窗口」在哪一代
+    // 版本上都算数。
+    if let Some((w, h)) = window {
+        if !game_args.iter().any(|a| a == "--width") {
+            game_args.push("--width".to_string());
+            game_args.push(w.to_string());
+            game_args.push("--height".to_string());
+            game_args.push(h.to_string());
+        }
+    }
+
+    // 全屏和窗口尺寸是两件事：`--fullscreen` 让游戏直接进独占全屏，
+    // 这时再给 `--width/--height` 也只会被当成「退回窗口时的尺寸」。
+    if config.fullscreen {
+        game_args.push("--fullscreen".to_string());
     }
 
     game_args.extend(config.extra_game_args.iter().cloned());
@@ -598,7 +636,7 @@ fn native_jar_path(
     config: &LaunchConfig,
 ) -> Option<PathBuf> {
     let classifier = lib.native_classifier(ctx.os.name.as_str())?;
-    let classifier = expand_arch_placeholder(&classifier, ctx);
+    let classifier = crate::rules::expand_arch_placeholder(&classifier, ctx);
     if classifier_arch(&classifier) != ctx.os.arch {
         return None;
     }
@@ -626,18 +664,6 @@ fn native_jar_path(
     None
 }
 
-/// 展开 classifier 里的 `${arch}` 占位符（老版本写法）。
-fn expand_arch_placeholder(classifier: &str, ctx: &RuleContext) -> String {
-    if !classifier.contains("${arch}") {
-        return classifier.to_string();
-    }
-    let bits = match ctx.os.arch {
-        crate::rules::Arch::X86 => "32",
-        _ => "64",
-    };
-    classifier.replace("${arch}", bits)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,7 +682,7 @@ mod tests {
     #[test]
     fn md5_matches_known_vectors() {
         let hex = |s: &[u8]| -> String {
-            md5(s).iter().map(|b| format!("{:02x}", b)).collect()
+            crate::hex::to_hex(&md5(s))
         };
         assert_eq!(hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
         assert_eq!(hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
@@ -728,6 +754,73 @@ mod tests {
         // 游戏参数里用户名被替换
         let u = plan.game_args.iter().position(|a| a == "--username").unwrap();
         assert_eq!(plan.game_args[u + 1], "Steve");
+    }
+
+    /// 指定窗口尺寸时，要给游戏传 `--width/--height`。
+    ///
+    /// 老清单（1.6 之前）里没有那一条参数，`has_custom_resolution` 无处可展开，
+    /// 所以 `build_plan` 自己补一对 —— 否则「按指定尺寸开窗口」在老版本上无声失效。
+    #[test]
+    fn a_window_size_is_passed_to_old_manifests_too() {
+        let version = simple_version();
+        let mut cfg = LaunchConfig::new("C:\\mc");
+        cfg.window_width = Some(1600);
+        cfg.window_height = Some(900);
+        let plan = build_plan(&version, &Account::offline("A"), &cfg);
+
+        let w = plan.game_args.iter().position(|a| a == "--width").unwrap();
+        assert_eq!(plan.game_args[w + 1], "1600");
+        let h = plan.game_args.iter().position(|a| a == "--height").unwrap();
+        assert_eq!(plan.game_args[h + 1], "900");
+        // 只该补一对，不能和清单里的重复
+        assert_eq!(plan.game_args.iter().filter(|a| *a == "--width").count(), 1);
+    }
+
+    /// 全屏靠 `--fullscreen`，不是靠尺寸。
+    ///
+    /// 这个参数任何一份版本清单里都没有，官方启动器也是自己补的。
+    #[test]
+    fn fullscreen_adds_the_flag_the_manifests_never_mention() {
+        let version = simple_version();
+        let mut cfg = LaunchConfig::new("C:\\mc");
+        cfg.fullscreen = true;
+        let plan = build_plan(&version, &Account::offline("A"), &cfg);
+        assert_eq!(plan.game_args.iter().filter(|a| *a == "--fullscreen").count(), 1);
+        // 全屏时不该再塞尺寸，否则退出全屏会跳到一个凭空定的窗口
+        assert!(!plan.game_args.iter().any(|a| a == "--width"));
+    }
+
+    /// 新版清单自己带 `--width/--height`，得靠 `has_custom_resolution` 展开。
+    #[test]
+    fn a_window_size_expands_the_modern_arguments() {
+        let v = parse_version(
+            r#"{"id":"1.21.7-test","mainClass":"net.minecraft.client.main.Main",
+                "assetIndex":{"id":"5"},"assets":"5","javaVersion":{"majorVersion":21},
+                "libraries":[],
+                "arguments":{
+                  "game":["--username","${auth_player_name}",
+                          {"rules":[{"action":"allow","features":{"has_custom_resolution":true}}],
+                           "value":["--width","${resolution_width}","--height","${resolution_height}"]}],
+                  "jvm":["-cp","${classpath}"]
+                }}"#,
+        )
+        .unwrap();
+        let version = resolve(&[v]).unwrap();
+
+        // 不给尺寸：那一条整条不展开，游戏自己决定窗口大小
+        let cfg = LaunchConfig::new("C:\\mc");
+        let plan = build_plan(&version, &Account::offline("A"), &cfg);
+        assert!(!plan.game_args.iter().any(|a| a == "--width"));
+
+        // 给了尺寸：展开成真实数字
+        let mut cfg = LaunchConfig::new("C:\\mc");
+        cfg.window_width = Some(1920);
+        cfg.window_height = Some(1080);
+        let plan = build_plan(&version, &Account::offline("A"), &cfg);
+        let w = plan.game_args.iter().position(|a| a == "--width").unwrap();
+        assert_eq!(plan.game_args[w + 1], "1920");
+        let h = plan.game_args.iter().position(|a| a == "--height").unwrap();
+        assert_eq!(plan.game_args[h + 1], "1080");
     }
 
     #[test]

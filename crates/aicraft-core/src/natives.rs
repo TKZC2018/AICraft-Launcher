@@ -121,6 +121,23 @@ pub struct ZipEntry {
 }
 
 impl ZipEntry {
+    /// 只为了测试而存在的空条目：给一个名字，其余字段全零。
+    ///
+    /// 「从一堆条目里认出想要的那一个」这套逻辑散在模组图标和整合包里，
+    /// 两边的用例都得先造条目 —— 造法留在这里一份，免得两边各抄一遍
+    /// 还要跟着结构体字段一起改。
+    #[cfg(test)]
+    pub fn stub(name: &str) -> ZipEntry {
+        ZipEntry {
+            name: name.to_string(),
+            compression: 0,
+            compressed_size: 0,
+            uncompressed_size: 0,
+            local_header_offset: 0,
+            is_dir: name.ends_with('/'),
+        }
+    }
+
     /// 读取该条目的解压后内容。
     pub fn read_data(&self, jar: &Path) -> io::Result<Vec<u8>> {
         let mut file = fs::File::open(jar)?;
@@ -164,10 +181,47 @@ pub fn read_zip_entries(jar: &Path) -> io::Result<Vec<ZipEntry>> {
 
 /// 从内存中的完整 ZIP 数据解析条目表。
 pub fn parse_zip(data: &[u8]) -> io::Result<Vec<ZipEntry>> {
+    let (total_entries, cd_offset, _) = find_eocd(data)?;
+    Ok(parse_central_directory(data, cd_offset, total_entries))
+}
+
+/// 只读中央目录，不把整个文件读进内存。
+///
+/// 资源包动辄几百 MB（FaithfulPBR_1024 是 877 MB），为了看一眼 pack.mcmeta
+/// 和 pack.png 把整包读进来显然不行。ZIP 的目录在文件尾部，那就只读尾部
+/// 那一段：先读最后 64 KiB 找 EOCD，再按它给的偏移量读中央目录。
+pub fn read_zip_index(path: &Path) -> io::Result<Vec<ZipEntry>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len < 22 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "文件太小，不是 ZIP"));
+    }
+    // 注释最长 65535 字节，加上 EOCD 本身的 22 字节
+    let tail_len = len.min(22 + 65535);
+    let mut tail = vec![0u8; tail_len as usize];
+    file.seek(SeekFrom::Start(len - tail_len))?;
+    file.read_exact(&mut tail)?;
+    // EOCD 里记的偏移量**本来就是相对整个文件**的，不随我们读的是哪一截而变，
+    // 所以这里不能再加上尾巴的起点 —— 加了就会指到文件外面去。
+    let (total_entries, cd_offset, cd_size) = find_eocd(&tail)?;
+    if cd_offset as u64 + cd_size as u64 > len {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "中央目录越界"));
+    }
+    let mut cd = vec![0u8; cd_size];
+    file.seek(SeekFrom::Start(cd_offset as u64))?;
+    file.read_exact(&mut cd)?;
+    Ok(parse_central_directory(&cd, 0, total_entries))
+}
+
+/// 找 EOCD（中央目录结尾），返回（条目数，中央目录偏移，中央目录长度）。
+///
+/// 偏移量相对传入的 data 起点算，调用方自己换算。
+fn find_eocd(data: &[u8]) -> io::Result<(usize, usize, usize)> {
     if data.len() < 22 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "文件太小，不是 ZIP"));
     }
-
     // 从尾部向前找 EOCD 签名 PK\x05\x06
     let mut eocd_pos = None;
     let min_pos = data.len().saturating_sub(22 + 65535);
@@ -187,15 +241,24 @@ pub fn parse_zip(data: &[u8]) -> io::Result<Vec<ZipEntry>> {
     })?;
 
     let total_entries = u16::from_le_bytes([data[eocd + 10], data[eocd + 11]]) as usize;
+    let cd_size = u32::from_le_bytes([
+        data[eocd + 12],
+        data[eocd + 13],
+        data[eocd + 14],
+        data[eocd + 15],
+    ]) as usize;
     let cd_offset = u32::from_le_bytes([
         data[eocd + 16],
         data[eocd + 17],
         data[eocd + 18],
         data[eocd + 19],
     ]) as usize;
+    Ok((total_entries, cd_offset, cd_size))
+}
 
+/// 从一段以中央目录开头的字节里逐个解析条目。
+fn parse_central_directory(data: &[u8], mut pos: usize, total_entries: usize) -> Vec<ZipEntry> {
     let mut entries = Vec::with_capacity(total_entries);
-    let mut pos = cd_offset;
 
     for _ in 0..total_entries {
         if pos + 46 > data.len() {
@@ -247,7 +310,7 @@ pub fn parse_zip(data: &[u8]) -> io::Result<Vec<ZipEntry>> {
         pos = name_end + extra_len + comment_len;
     }
 
-    Ok(entries)
+    entries
 }
 
 /// 判断某个 natives 目标目录里是否已经有可用文件。

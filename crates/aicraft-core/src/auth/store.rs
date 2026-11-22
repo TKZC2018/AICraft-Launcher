@@ -113,6 +113,20 @@ impl StoredAccount {
         self.api_root.is_some()
     }
 
+    /// 列表里谁排在前面：正版在上，第三方居中，离线在下。
+    ///
+    /// 只按类型分组，组内保持加入的先后 —— 换个账号就把整张列表洗一遍，
+    /// 眼睛每次都得重新找位置，比「最近的排最前」难用得多。
+    pub fn rank(&self) -> u8 {
+        if self.offline {
+            2
+        } else if self.is_third_party() {
+            1
+        } else {
+            0
+        }
+    }
+
     /// 能否自动续期。离线名字没有令牌，也就没有续期这回事。
     pub fn can_refresh(&self) -> bool {
         if self.offline {
@@ -195,9 +209,45 @@ impl StoredAccount {
         self.update_from(&account, &tokens);
         Ok(account)
     }
+
+    /// 不管这条记录是正版还是第三方，都给它续一次期。
+    ///
+    /// 界面上的「刷新」按钮按的是同一个键，可两条路完全不同：微软那边
+    /// 换 refresh token 还要过 Xbox 四跳，皮肤站只要拿 accessToken 找回
+    /// 自己。分成两个函数由调用方判断的话，每多一个入口就多一处要记得
+    /// 分支——所以在这儿收口一次。
+    ///
+    /// 续完把新的令牌写回自己，调用方负责存回账号文件。
+    pub fn refresh_any(&mut self, http: &dyn Http, client_id: &str) -> Result<(), AuthError> {
+        match self.api_root.clone() {
+            Some(root) => {
+                let access = self.access_token.clone();
+                let client = self.client_token.clone().unwrap_or_default();
+                let session = super::yggdrasil::refresh(http, &root, &access, &client)?;
+                self.update_from_yggdrasil(&session);
+                Ok(())
+            }
+            None => {
+                self.refresh(http, client_id)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// 用一次第三方续期的结果覆盖令牌字段。
+    ///
+    /// 皮肤站的续期会换掉 accessToken，name 也可能被改过（玩家在站上
+    /// 改了名），uuid 不会变——所以这里不碰 uuid，只跟新名字和令牌。
+    pub fn update_from_yggdrasil(&mut self, session: &super::yggdrasil::Session) {
+        self.name = session.name.clone();
+        self.access_token = session.access_token.clone();
+        self.client_token = Some(session.client_token.clone());
+        // Yggdrasil 侧不给我们过期时间，0 表示「不按时间判失效」。
+        self.expires_at = 0;
+    }
 }
 
-/// 账号列表，按最近使用排序。
+/// 账号列表，按账号类型分组：正版在上，第三方居中，离线在下。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AccountStore {
     pub accounts: Vec<StoredAccount>,
@@ -282,10 +332,13 @@ impl AccountStore {
             .unwrap_or("")
             .to_string();
 
-        Ok(AccountStore {
+        let mut store = AccountStore {
             accounts,
             last_uuid,
-        })
+        };
+        // 老文件是按「最近使用」存的，读进来先归一次位。
+        store.arrange();
+        Ok(store)
     }
 
     pub fn to_json(&self) -> String {
@@ -354,13 +407,28 @@ impl AccountStore {
         })
     }
 
-    /// 插入或更新一个账号，并把它挪到最前面（最近使用）。
+    /// 插入或更新一个账号。
     ///
     /// 同一个 UUID 视为同一个账号：换 token 时原地更新，不堆重复项。
+    /// 位置不动 —— 新账号按类型落到它那一组的末尾，已有的账号留在原地。
     pub fn upsert(&mut self, account: StoredAccount) {
         self.last_uuid = account.uuid.clone();
-        self.accounts.retain(|a| a.uuid != account.uuid);
-        self.accounts.insert(0, account);
+        // 已有就原地替换：续期只是换了 token，卡片不该因此跳位置。
+        if let Some(slot) = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.uuid == account.uuid)
+        {
+            *slot = account;
+            return;
+        }
+        self.accounts.push(account);
+        self.arrange();
+    }
+
+    /// 把列表按「正版 / 第三方 / 离线」归位。组内顺序不动（稳定排序）。
+    pub fn arrange(&mut self) {
+        self.accounts.sort_by_key(|account| account.rank());
     }
 
     /// 当前该用哪个账号。
@@ -376,16 +444,12 @@ impl AccountStore {
         self.accounts.first()
     }
 
-    /// 切到某个账号：记下来，并挪到队首（列表按最近使用排序）。
+    /// 切到某个账号：只记下来，不动列表顺序。
     pub fn select(&mut self, uuid: &str) -> bool {
         if !self.accounts.iter().any(|a| a.uuid == uuid) {
             return false;
         }
         self.last_uuid = uuid.to_string();
-        if let Some(index) = self.accounts.iter().position(|a| a.uuid == uuid) {
-            let account = self.accounts.remove(index);
-            self.accounts.insert(0, account);
-        }
         true
     }
 
@@ -401,6 +465,7 @@ impl AccountStore {
             // 删掉的正是上次用的那个：让 current() 自然回退到剩下的第一条
             self.last_uuid.clear();
         }
+        self.arrange();
         removed
     }
 }
@@ -541,7 +606,7 @@ mod tests {
         let mut store = AccountStore::default();
         store.upsert(StoredAccount::offline("甲"));
         store.upsert(StoredAccount::offline("乙"));
-        // upsert 把最近插入的挪到队首，也就是当前账号
+        // upsert 记下「最近用的是谁」，但不动位置
         assert_eq!(store.current().map(|a| a.name.as_str()), Some("乙"));
 
         let back = AccountStore::from_json(&store.to_json()).unwrap();
@@ -552,19 +617,55 @@ mod tests {
     }
 
     #[test]
-    fn selecting_an_account_moves_it_to_the_front() {
+    fn selecting_an_account_leaves_the_list_where_it_was() {
         let mut store = AccountStore::default();
         store.upsert(StoredAccount::offline("甲"));
         let target = store.accounts[0].uuid.clone();
         store.upsert(StoredAccount::offline("乙"));
-        assert_eq!(store.current().map(|a| a.name.as_str()), Some("乙"));
+        let before: Vec<String> = store.accounts.iter().map(|a| a.name.clone()).collect();
 
         assert!(store.select(&target));
         assert_eq!(store.current().map(|a| a.name.as_str()), Some("甲"));
-        assert_eq!(store.accounts[0].name, "甲");
+        // 顺序原样：换个账号不该让整张列表洗一遍
+        let after: Vec<String> = store.accounts.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(before, after);
         // 不认识的 UUID 不改变现状
         assert!(!store.select("nope"));
         assert_eq!(store.current().map(|a| a.name.as_str()), Some("甲"));
+    }
+
+    #[test]
+    fn the_list_is_grouped_by_account_kind() {
+        let mut store = AccountStore::default();
+        // 故意倒着加：离线先进，正版最后进
+        store.upsert(StoredAccount::offline("离线甲"));
+        store.upsert(StoredAccount {
+            api_root: Some("https://example.invalid".to_string()),
+            offline: false,
+            ..StoredAccount::offline("第三方甲")
+        });
+        store.upsert(sample());
+        store.upsert(StoredAccount::offline("离线乙"));
+
+        let ranks: Vec<u8> = store.accounts.iter().map(|a| a.rank()).collect();
+        assert_eq!(ranks, vec![0, 1, 2, 2], "正版 → 第三方 → 离线");
+        // 组内保持加入顺序，不是按名字也不是按最近使用
+        let names: Vec<&str> = store.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["Steve", "第三方甲", "离线甲", "离线乙"]);
+    }
+
+    #[test]
+    fn an_old_file_is_regrouped_when_it_is_read() {
+        // 老版本按「最近使用」存，正版可能被挤到离线后面。
+        let text = r#"{"version":1,"last_uuid":"off","accounts":[
+            {"uuid":"off","name":"离线","access_token":"0000","offline":true},
+            {"uuid":"ms","name":"正版","access_token":"tok"}
+        ]}"#;
+        let store = AccountStore::from_json(text).unwrap();
+        let names: Vec<&str> = store.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["正版", "离线"]);
+        // 当前账号还是老文件里记的那个，不因为归位而改变
+        assert_eq!(store.current().map(|a| a.name.as_str()), Some("离线"));
     }
 
     #[test]
@@ -628,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn upsert_replaces_same_uuid_and_moves_to_front() {
+    fn upsert_replaces_the_same_uuid_in_place() {
         let mut store = AccountStore::default();
         store.upsert(StoredAccount {
             name: "Old".to_string(),
@@ -645,8 +746,11 @@ mod tests {
         });
 
         assert_eq!(store.accounts.len(), 2);
+        // 同 UUID 原地更新，不搬家：续期换了 token 也不该让卡片跳位置
         assert_eq!(store.accounts[0].name, "New");
         assert_eq!(store.accounts[1].uuid, "uuid-2");
+        // 最近用的是谁，仍然记得
+        assert_eq!(store.last_uuid, store.accounts[0].uuid);
     }
 
     #[test]
@@ -766,5 +870,48 @@ mod tests {
         };
         let error = account.refresh(&mock, "client-1").unwrap_err();
         assert_eq!(error.kind, AuthErrorKind::InvalidGrant);
+    }
+
+    /// 第三方账号走皮肤站那条续期，别去碰微软。
+    #[test]
+    fn refresh_any_sends_third_party_accounts_to_their_own_server() {
+        let mock = MockHttp::new(vec![HttpResponse {
+            status: 200,
+            body: r#"{"accessToken":"new-token","clientToken":"new-client","selectedProfile":{"id":"4f1e","name":"改了名"}}"#
+                .to_string(),
+        }]);
+        let mut account = StoredAccount {
+            api_root: Some("https://skin.example.com/api/yggdrasil".to_string()),
+            client_token: Some("old-client".to_string()),
+            ..sample()
+        };
+
+        account.refresh_any(&mock, "client-1").unwrap();
+
+        assert_eq!(account.access_token, "new-token");
+        assert_eq!(account.client_token.as_deref(), Some("new-client"));
+        assert_eq!(account.name, "改了名");
+        // Yggdrasil 不给过期时间，0 表示不按时间判失效
+        assert_eq!(account.expires_at, 0);
+        let url = mock.log.borrow()[0].1.clone();
+        assert_eq!(url, "https://skin.example.com/api/yggdrasil/authserver/refresh");
+    }
+
+    /// 正版账号仍然走原来那条微软五跳。
+    #[test]
+    fn refresh_any_leaves_microsoft_accounts_on_the_msa_route() {
+        let mock = refresh_responses(
+            r#"{"access_token":"msa-2","refresh_token":"rt-2","expires_in":3600}"#,
+            r#"{"access_token":"mc-2","expires_in":86400}"#,
+        );
+        let mut account = StoredAccount {
+            expires_at: 1,
+            ..sample()
+        };
+
+        account.refresh_any(&mock, "client-1").unwrap();
+
+        assert_eq!(account.access_token, "mc-2");
+        assert!(account.expires_at > 1_700_000_000);
     }
 }

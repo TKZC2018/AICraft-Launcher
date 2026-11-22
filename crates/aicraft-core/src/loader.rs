@@ -197,18 +197,6 @@ fn neoforge_installer_candidates(
 
 // ---------------------------------------------------------------- Fabric
 
-/// 从一组完整地址里挑第一个能用的取文本。
-pub fn fetch_text_urls(urls: &[String]) -> Result<String, String> {
-    let mut errors = Vec::new();
-    for url in urls {
-        match crate::transport::fetch_text(url) {
-            Ok(text) => return Ok(text),
-            Err(e) => errors.push(format!("{}: {}", url, e)),
-        }
-    }
-    Err(format!("都拿不到，试过：{}", errors.join("；")))
-}
-
 /// 从一组完整地址里挑第一个能用的下载到 `dest`。
 pub fn download_urls(urls: &[String], dest: &Path) -> Result<PathBuf, String> {
     let mut errors = Vec::new();
@@ -1288,7 +1276,7 @@ pub fn installer_java(game_dir: &Path, mc_version: &str) -> Result<PathBuf, Stri
     }
     let (runtime, _) = crate::java::pick_java_choice(&runtimes, required)
         .ok_or_else(|| format!("本机 Java 都低于 {}，安装器跑不起来", required))?;
-    Ok(console_java(&runtime.path))
+    Ok(crate::java::console_java(&runtime.path))
 }
 
 /// 读原版版本 JSON 里声明的 Java 主版本。
@@ -1303,20 +1291,6 @@ fn base_java_major(game_dir: &Path, mc_version: &str) -> Option<u32> {
     let text = std::fs::read_to_string(path).ok()?;
     let raw = parse_version(&text).ok()?;
     raw.java_version.major_version
-}
-
-/// `javaw.exe` 收不到输出，跑安装器要换成 `java.exe`。
-fn console_java(path: &Path) -> PathBuf {
-    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    if !name.eq_ignore_ascii_case("javaw.exe") {
-        return path.to_path_buf();
-    }
-    let sibling = path.with_file_name("java.exe");
-    if sibling.is_file() {
-        sibling
-    } else {
-        path.to_path_buf()
-    }
 }
 
 /// 版本清单里记加载器的键。
@@ -1640,9 +1614,9 @@ fn detect_from_ids(instance_id: &str, official_id: &str) -> Option<(LoaderKind, 
 
 /// 把已装实例的 Fabric 加载器换一个版本，就地改。
 ///
-/// 只动 `versions/<实例>/<实例>.json` 与 `libraries/` 里的 Fabric 库：
-/// 旧的 loader jar 留在 libraries 里不删（别的实例可能还在用，而且删了也不省心），
-/// 存档、模组、配置都不碰。
+/// 只动 `versions/<实例>/<实例>.json` 与 `libraries/`：换完之后顺手把
+/// 「已经没有任何实例引用」的旧库删掉（见 [`crate::prune`]），存档、模组、
+/// 配置都不碰。别的实例还在用的库会留着。
 ///
 /// 为什么只支持 Fabric：Forge / NeoForge 换版本必须重跑它们自己的安装器，
 /// 安装器只会往 `versions/<游戏版本>-forge-<版本>/` 写，改不了现成的目录。
@@ -1672,7 +1646,7 @@ where
             concurrency,
             cancel,
             on_progress,
-            on_log,
+            &mut on_log,
         ),
         LoaderKind::Forge | LoaderKind::NeoForge => switch_installer_loader(
             game_dir,
@@ -1685,7 +1659,127 @@ where
             on_progress,
             &mut on_log,
         ),
+    }?;
+
+    // 换完之后，旧加载器那一套库已经没有任何实例在用了，留在盘上只是白占地方。
+    // 清理本身失败不影响「换成功了」这个结论，所以只记一句日志。
+    let ctx = crate::rules::RuleContext::current();
+    match crate::prune::prune_libraries(game_dir, &ctx) {
+        Ok(report) if report.removed > 0 => on_log(&format!(
+            "顺手清掉 {} 个没人再用的旧库（{:.1} MB）",
+            report.removed,
+            report.bytes as f64 / 1_048_576.0
+        )),
+        Ok(_) => {}
+        Err(e) => on_log(&format!("旧库没清理（{}），下次再说", e)),
     }
+    Ok(())
+}
+
+/// 把实例换到另一个原版底座上，加载器种类与版本原样保留。
+///
+/// 换底座会连带重装加载器（Forge 的 patch、Fabric 的映射都绑定在具体游戏版本
+/// 上，换个底座不重装等于留一份跑不起来的清单），所以这里做的事和
+/// [`switch_loader`] 几乎一样，只是「先换底座，再按原加载器装一遍」。
+///
+/// 模组、存档、配置一个字节都不动 —— 它们和游戏版本无关，出问题的是模组本身
+/// 能不能跑。界面上因此必须先讲清楚这一点再让人点。
+#[allow(clippy::too_many_arguments)]
+pub fn change_game_version<F>(
+    game_dir: &Path,
+    instance: &str,
+    new_game_version: &str,
+    mirror: &crate::settings::Mirror,
+    concurrency: usize,
+    cancel: &crate::cancel::CancelToken,
+    on_progress: &(dyn Fn(LoaderProgress) + Send + Sync),
+    mut on_log: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str),
+{
+    let loader = detect_installed(game_dir, instance);
+    on_log(&format!(
+        "把 {} 从 {} 换到 {}{}",
+        instance,
+        crate::install::instance_game_version(game_dir, instance).unwrap_or_else(|| "?".to_string()),
+        new_game_version,
+        match &loader {
+            Some((kind, version)) => format!("（{} {} 会跟着重装）", kind.label(), version),
+            None => "（纯原版，不用装加载器）".to_string(),
+        }
+    ));
+
+    rebase_instance(game_dir, instance, new_game_version)?;
+    on_log(&format!("底座换好了：{} 现在挂在 {} 上", instance, new_game_version));
+
+    match loader {
+        Some((kind, version)) => {
+            on_log(&format!("重装 {} {}…", kind.label(), version));
+            switch_loader(
+                game_dir,
+                instance,
+                new_game_version,
+                kind,
+                &version,
+                mirror,
+                concurrency,
+                cancel,
+                on_progress,
+                &mut on_log,
+            )?;
+        }
+        None => {
+            let ctx = crate::rules::RuleContext::current();
+            if let Ok(report) = crate::prune::prune_libraries(game_dir, &ctx) {
+                if report.removed > 0 {
+                    on_log(&format!(
+                        "顺手清掉 {} 个没人再用的旧库（{:.1} MB）",
+                        report.removed,
+                        report.bytes as f64 / 1_048_576.0
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 把实例清单改写成「挂在 `new_game_version` 上的空壳」，再压平成自包含清单。
+///
+/// 空壳里只留 `id` / `inheritsFrom` / 官方版本号：`resolve` 会从父版本那层
+/// 取回 mainClass、库、参数，压平时一次写全。旧加载器的 `_aicraftLoader` 与
+/// `patches` 必须一起丢掉 —— 留着它，`detect_installed` 会以为加载器还在。
+fn rebase_instance(game_dir: &Path, instance: &str, new_game_version: &str) -> Result<(), String> {
+    if !crate::install::is_installed(game_dir, new_game_version) {
+        return Err(format!(
+            "{} 还没装好：先把这一版原版装上，再换底座",
+            new_game_version
+        ));
+    }
+    let thin = crate::json::Json::Object(vec![
+        ("id".to_string(), crate::json::Json::Str(instance.to_string())),
+        (
+            "inheritsFrom".to_string(),
+            crate::json::Json::Str(new_game_version.to_string()),
+        ),
+        (
+            crate::install::OFFICIAL_ID_KEY.to_string(),
+            crate::json::Json::Str(new_game_version.to_string()),
+        ),
+    ]);
+    let path = crate::instance::version_dir(game_dir, instance).join(format!("{}.json", instance));
+    std::fs::write(&path, crate::json::write(&thin))
+        .map_err(|e| format!("写实例清单失败: {}", e))?;
+    // 旧底座那份客户端 jar 还躺在实例目录里，压平时它会被当成「已经有了」
+    // 直接跳过，于是清单说 26.3、jar 却是 1.20.1。先挪开，让压平重新链接。
+    let stale = crate::instance::version_dir(game_dir, instance).join(format!("{}.jar", instance));
+    if stale.is_file() {
+        let _ = std::fs::remove_file(&stale);
+    }
+    // 压平顺带把新底座的客户端 jar 链接进来，否则启动时找不到主类。
+    crate::flatten::rewrite_instance(game_dir, instance)?;
+    Ok(())
 }
 
 /// Forge / NeoForge 的就地安装：让安装器照常装到它自己的新目录，再把那份
@@ -1856,7 +1950,7 @@ fn switch_fabric<F>(
     concurrency: usize,
     cancel: &crate::cancel::CancelToken,
     on_progress: &(dyn Fn(LoaderProgress) + Send + Sync),
-    mut on_log: F,
+    on_log: &mut F,
 ) -> Result<(), String>
 where
     F: FnMut(&str),
@@ -2299,6 +2393,49 @@ mod tests {
         let text = std::fs::read_to_string(instance_dir.join("26.3-生存.json")).unwrap();
         assert!(text.contains("26.3-生存"));
         assert!(text.contains("_aicraftOfficialId"));
+    }
+
+    #[test]
+    fn rebasing_onto_a_missing_base_is_refused() {
+        let dir = crate::testutil::fresh_dir("loader-rebase-missing");
+        let instance_dir = dir.join("versions").join("我的世界");
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        std::fs::write(
+            instance_dir.join("我的世界.json"),
+            r#"{"id":"我的世界","inheritsFrom":"1.20.1"}"#,
+        )
+        .unwrap();
+
+        let err = rebase_instance(&dir, "我的世界", "1.21.1").unwrap_err();
+        assert!(err.contains("1.21.1"), "报错里要写清是哪个版本没装：{}", err);
+        // 拒绝得干净：实例清单一个字节都不该动。
+        let text = std::fs::read_to_string(instance_dir.join("我的世界.json")).unwrap();
+        assert!(text.contains("1.20.1"));
+    }
+
+    #[test]
+    fn rebasing_rewrites_the_instance_onto_the_new_base() {
+        let dir = crate::testutil::fresh_dir("loader-rebase-ok");
+        let base_dir = dir.join("versions").join("1.21.1");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(
+            base_dir.join("1.21.1.json"),
+            r#"{"id":"1.21.1","mainClass":"net.minecraft.client.main.Main"}"#,
+        )
+        .unwrap();
+        let instance_dir = dir.join("versions").join("我的世界");
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        std::fs::write(
+            instance_dir.join("我的世界.json"),
+            r#"{"id":"我的世界","inheritsFrom":"1.20.1"}"#,
+        )
+        .unwrap();
+
+        // 压平那一步会去读父版本的清单，这里只验「薄清单写对了」——
+        // 完整压平要一整套库与素材，那不是这个函数的职责。
+        let _ = rebase_instance(&dir, "我的世界", "1.21.1");
+        let text = std::fs::read_to_string(instance_dir.join("我的世界.json")).unwrap();
+        assert!(text.contains("1.21.1"), "清单该挂到新底座上：{}", text);
     }
 
     #[test]

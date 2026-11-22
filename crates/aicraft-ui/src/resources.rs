@@ -17,11 +17,14 @@ use aicraft_core::modrinth::{ModDetail, ModFile, ModHit, ModVersion, ProjectKind
 use crate::icons;
 use crate::theme;
 
-/// 一页装多少个模组。
+/// 一页能装多少条，给玩家自己挑。
 ///
-/// 20 是 Modrinth 的默认值，也是「滚两屏」的量；再多就得靠翻页，
-/// 不如点一次「下一页」来得痛快。
-const PAGE: usize = 20;
+/// 5 到 100：5 适合一屏一屏地细看，100 适合先扫一遍再决定。
+/// Modrinth 单次最多给 100，再多就得再翻一页。
+const PAGE_CHOICES: [usize; 6] = [5, 10, 15, 20, 50, 100];
+
+/// 默认每页 20 条 —— 滚两屏的量，也是 Modrinth 自己的默认值。
+const DEFAULT_PAGE: usize = 20;
 
 /// 结果卡片的高度。固定下来，滚动条才不会因为标题长短一跳一跳。
 const ROW_H: f32 = 82.0;
@@ -59,10 +62,23 @@ pub struct State {
     pub hits: Vec<ModHit>,
     pub total: u64,
     pub offset: usize,
+    /// 一页装多少条（`PAGE_CHOICES` 里的一个）。改它会回到第一页重搜。
+    pub page_size: usize,
     pub loading: bool,
     pub error: Option<String>,
     /// 装进哪个实例（版本目录名）。空 = 还没选。
     pub target: Option<String>,
+    /// 数据包装进哪个存档。空 = 还没选。
+    ///
+    /// 数据包只对某一个存档生效，所以除了实例还要再挑一次存档；
+    /// 别的类别不看这个字段。
+    pub world: Option<String>,
+    /// 上一次同步时主页选中的那个版本。
+    ///
+    /// 安装目标默认跟着主页走：主页一换版本，这里就跟着换。存下上一次
+    /// 同步的值，才能分清「主页换了」和「只是玩家自己在下拉里挑了别的」——
+    /// 前者要跟着改，后者得留着。
+    pub synced_home: Option<String>,
     /// 装完/失败后留一句话在工具栏上，不用去翻日志
     pub notice: Option<(String, bool)>,
     /// 模组图标的纹理（下载与解码在 `main.rs` 的后台线程里跑）
@@ -80,6 +96,10 @@ pub struct State {
     /// 用来区分「还没来得及搜」和「搜过了但一条都没命中」——后者也是
     /// `hits.is_empty()`，只按结果判空会陷入「搜空 → 以为没搜 → 再搜」的死循环。
     pub searched: Option<ProjectKind>,
+    /// 这一批结果开始「逐行进场」的时刻；播完置回 None。
+    ///
+    /// 跟 `hits` 一起换：新结果到了才重播，翻页或只是滚列表都不重播。
+    pub reveal_at: Option<std::time::Instant>,
 }
 
 /// 详情页的状态。
@@ -256,12 +276,16 @@ impl Default for State {
             hits: Vec::new(),
             total: 0,
             offset: 0,
+            page_size: DEFAULT_PAGE,
             loading: false,
             error: None,
             target: None,
+            world: None,
+            synced_home: None,
             notice: None,
             icons: icons::Cache::default(),
             detail: None,
+            reveal_at: None,
         }
     }
 }
@@ -328,6 +352,18 @@ impl State {
             && self.searched != Some(self.kind)
     }
 
+    /// 这一页实际要多少条。
+    ///
+    /// 兜住两种情况：`page_size` 没在候选表里（旧状态或手改的配置），
+    /// 以及超过 Modrinth 单次 100 条的上限。
+    pub fn page_limit(&self) -> usize {
+        if PAGE_CHOICES.contains(&self.page_size) {
+            self.page_size
+        } else {
+            DEFAULT_PAGE
+        }
+    }
+
     /// 按当前条件拼出搜索请求。
     pub fn query_spec(&self) -> aicraft_core::modrinth::SearchQuery {
         let table = self.kind.categories();
@@ -344,18 +380,51 @@ impl State {
             ),
             sort: Some(self.sort),
             offset: self.offset,
-            limit: PAGE,
+            limit: self.page_limit(),
         }
     }
 
-    /// 选中一个实例（找不到就保持原样）。
-    pub fn pick_target(&mut self, instances: &[String]) {
+    /// 选中一个实例。
+    ///
+    /// `preferred` 是主页上当前选中的那个版本，安装目标默认跟着它走：
+    /// 主页换了版本，这里也跟着换 —— 玩家刚在主页点开哪个版本，多半就是
+    /// 想往哪个里面装东西。
+    ///
+    /// 主页没换的时候，玩家在下拉里自己挑的那个要留着；只有它被删掉了
+    /// 才回退。主页那个版本没装成实例（或者压根没有实例）时，退回列表里的
+    /// 第一个。
+    pub fn pick_target(&mut self, instances: &[String], preferred: Option<&str>) {
+        let home_changed = self.synced_home.as_deref() != preferred;
+        if home_changed {
+            self.synced_home = preferred.map(str::to_string);
+            self.target = preferred
+                .filter(|name| instances.iter().any(|i| i == name))
+                .map(str::to_string)
+                .or_else(|| instances.first().cloned());
+            return;
+        }
         let valid = self
             .target
             .as_deref()
             .is_some_and(|t| instances.iter().any(|i| i == t));
         if !valid {
             self.target = instances.first().cloned();
+        }
+    }
+}
+
+impl State {
+    /// 让选中的存档跟着实际存在的存档走。
+    ///
+    /// 存档不像实例那样有「主页选中的那个」可以跟，所以只在它不存在了
+    /// 的时候退回第一个；玩家手挑的那个只要还在就留着。
+    pub fn pick_world(&mut self, worlds: &[String]) {
+        let valid = self
+            .world
+            .as_deref()
+            .is_some_and(|w| worlds.iter().any(|i| i == w));
+        if !valid {
+            self.world = worlds.first().cloned();
         }
     }
 }
@@ -368,8 +437,12 @@ pub enum Action {
     OpenDetail(String, String),
     /// 退出详情页，回到搜索结果
     CloseDetail,
-    /// 装详情页里选中的那一版
+    /// 装详情页里选中的那一版（模组 / 资源包 / 光影包）
     InstallFile(ModFile),
+    /// 把详情页里选中的那个数据包装进当前存档
+    InstallDatapack(ModFile),
+    /// 下载详情页里选中的那一版整合包，下完交给导入流程
+    DownloadPack(ModFile),
     /// 用浏览器打开一个链接
     OpenUrl(String),
 }
@@ -385,209 +458,301 @@ impl Action {
             Action::OpenDetail(_, title) => format!("资源下载：打开「{}」的详情", title),
             Action::CloseDetail => "资源下载：返回搜索结果".to_string(),
             Action::InstallFile(file) => format!("资源下载：下载 {}", file.filename),
+            Action::InstallDatapack(file) => format!("资源下载：下载数据包 {}", file.filename),
+            Action::DownloadPack(file) => format!("资源下载：下载整合包 {}", file.filename),
             Action::OpenUrl(url) => format!("资源下载：打开链接 {}", url),
         }
     }
 }
 
-/// 画整页。
+/// 这一页要用到的两份「装到哪儿」清单。
 ///
+/// 摊成两个参数时 `page` 会数到八个，读起来一串 `&[String]` 分不清谁是谁；
+/// 收进一个结构体，调用处也顺带能看清各自是什么。
+pub struct Targets<'a> {
+    /// 当前游戏目录里已经装好的实例名
+    pub instances: &'a [String],
+    /// 安装目标那个实例下的存档名（数据包要挑一个才放得进去）
+    pub worlds: &'a [String],
+}
+
+/// 画整页。///
 /// `instances` 是当前游戏目录里已经装好的实例名，用来选装到哪儿；
+/// `preferred` 是主页当前选中的版本，第一次进来时默认装到它里面；
 /// `busy` 是全局忙碌提示（正在装模组时它会说「正在装 xxx」）。
 pub fn page(
     ui: &mut egui::Ui,
     state: &mut State,
-    instances: &[String],
+    targets: Targets<'_>,
+    preferred: Option<&str>,
     busy: Option<&str>,
+    animate: bool,
+    // 页头动画已经跑了多久（秒）；None = 早就播完，或者动画关着。
+    //
+    // 和 `target` 那三个参数一样，时间由 `main.rs` 拿着
+    // （`title_slide_at` 是 App 上的一份），这里只把三段折成各自的进度。
+    head: Option<f32>,
 ) -> Option<Action> {
-    state.pick_target(instances);
+    let Targets { instances, worlds } = targets;
+    state.pick_target(instances, preferred);
+    if state.kind.installs_into_world() {
+        state.pick_world(worlds);
+    }
     let mut action = None;
     let mut dirty = false;
 
     // 详情页是一个「子页」而不是浮层：它要放长简介和几十个版本，
     // 用弹窗会挤，用整页替换反而干净——反正返回按钮就在左上角。
     if state.detail.is_some() {
-        return detail_page(ui, state, busy);
+        return detail_page(ui, state, worlds, busy);
     }
 
     // ---- 标题行 ----
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(state.kind.label()).size(17.0).strong());
-        ui.add_space(4.0);
-        if theme::refresh_button(ui, !state.loading && busy.is_none())
-            .on_hover_text("重新搜索")
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
-            state.offset = 0;
-            action = Some(Action::Search(state.kind));
-        }
-        ui.add_space(6.0);
-        if state.loading {
-            ui.spinner();
-            ui.label(
-                RichText::new("正在向 Modrinth 查询…")
-                    .size(11.0)
-                    .color(theme::TEXT_WEAK),
-            );
-        } else if let Some(text) = busy {
-            ui.spinner();
-            ui.label(RichText::new(text).size(11.0).color(theme::ACCENT_STRONG));
-        } else if let Some((text, ok)) = &state.notice {
-            ui.label(RichText::new(text).size(11.0).color(if *ok {
-                theme::ACCENT_STRONG
-            } else {
-                theme::DANGER
-            }));
-        } else if state.total > 0 {
-            ui.label(
-                RichText::new(format!("共 {} 个{}", state.total, state.kind.unit()))
-                    .size(11.0)
-                    .color(theme::TEXT_WEAK),
-            );
-        }
+    let title = theme::slide_progress(head, 0.0, theme::TITLE_SLIDE_SECS);
+    theme::title_slide(ui, title, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(state.kind.label()).size(17.0).strong());
+            ui.add_space(4.0);
+            if theme::refresh_button(ui, !state.loading && busy.is_none())
+                .on_hover_text("重新搜索")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                state.offset = 0;
+                action = Some(Action::Search(state.kind));
+            }
+            ui.add_space(6.0);
+            if state.loading {
+                ui.spinner();
+                ui.label(
+                    RichText::new("正在向 Modrinth 查询…")
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            } else if let Some(text) = busy {
+                ui.spinner();
+                ui.label(RichText::new(text).size(11.0).color(theme::accent_strong()));
+            } else if let Some((text, ok)) = &state.notice {
+                ui.label(RichText::new(text).size(11.0).color(if *ok {
+                    theme::accent_strong()
+                } else {
+                    theme::DANGER
+                }));
+            }
+            // 这里不再报「共多少个」：页脚已经用「第 1–20 条」说清了范围，
+            // 标题行留给标题本身，两处都报总数反而显得吵。
+        });
     });
     ui.add_space(10.0);
 
-    // ---- 第一行筛选：搜索框 + 分类 / 加载器 ----
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(16.0);
-            // 加载器只对模组有意义：资源包和光影包在 Modrinth 上挂的是
-            // 「谁能读它」（minecraft / iris / optifine），不是加载器。
-            if state.kind.has_loader() {
-                let loader_label = state
-                    .loader
-                    .map(|l| l.label().to_string())
-                    .unwrap_or_else(|| "全部加载器".to_string());
-                let combo = egui::ComboBox::from_id_salt("res-loader")
-                    .selected_text(RichText::new(loader_label).size(12.0))
-                    .width(112.0)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_value(&mut state.loader, None, "全部加载器")
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                        for kind in LoaderKind::ALL {
-                            if ui
-                                .selectable_value(&mut state.loader, Some(kind), kind.label())
+    let first = theme::slide_progress(head, theme::TOOLBAR_SLIDE_DELAY, theme::TITLE_SLIDE_SECS);
+    theme::title_slide(ui, first, |ui| {
+        // ---- 第一行筛选：搜索框 + 分类 / 加载器 ----
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(16.0);
+                // 加载器只对模组有意义：资源包和光影包在 Modrinth 上挂的是
+                // 「谁能读它」（minecraft / iris / optifine），不是加载器。
+                if state.kind.has_loader() {
+                    let loader_label = state
+                        .loader
+                        .map(|l| l.label().to_string())
+                        .unwrap_or_else(|| "全部加载器".to_string());
+                    let combo = theme::combo_centered(
+                        ui,
+                        "res-loader",
+                        RichText::new(loader_label).size(12.0),
+                        112.0,
+                        |ui| {
+                            if theme::combo_value(ui, &mut state.loader, None, "全部加载器")
                                 .changed()
                             {
                                 dirty = true;
                             }
+                            for kind in LoaderKind::ALL {
+                                if theme::combo_value(
+                                    ui,
+                                    &mut state.loader,
+                                    Some(kind),
+                                    kind.label(),
+                                )
+                                .changed()
+                                {
+                                    dirty = true;
+                                }
+                            }
+                        },
+                    );
+                    theme::hand(combo);
+                }
+
+                let table = state.kind.categories();
+                let category_label = table
+                    .get(state.category)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("全部分类");
+                let mut picked = state.category;
+                let combo = theme::combo_centered(
+                    ui,
+                    "res-category",
+                    RichText::new(category_label).size(12.0),
+                    112.0,
+                    |ui| {
+                        for (i, (_, label)) in table.iter().enumerate() {
+                            theme::combo_value(ui, &mut picked, i, label);
                         }
-                    });
-                theme::hand(combo.response);
-            }
+                    },
+                );
+                theme::hand(combo);
+                if picked != state.category {
+                    state.category = picked;
+                    dirty = true;
+                }
 
-            let table = state.kind.categories();
-            let category_label = table
-                .get(state.category)
-                .map(|(_, label)| *label)
-                .unwrap_or("全部分类");
-            let mut picked = state.category;
-            let combo = egui::ComboBox::from_id_salt("res-category")
-                .selected_text(RichText::new(category_label).size(12.0))
-                .width(112.0)
-                .show_ui(ui, |ui| {
-                    for (i, (_, label)) in table.iter().enumerate() {
-                        ui.selectable_value(&mut picked, i, *label);
-                    }
-                });
-            theme::hand(combo.response);
-            if picked != state.category {
-                state.category = picked;
-                dirty = true;
-            }
-
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut state.query)
-                    .hint_text(format!("搜索{}…", state.kind.unit()))
-                    .desired_width(ui.available_width().max(150.0)),
-            );
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                state.offset = 0;
-                action = Some(Action::Search(state.kind));
-            }
+                let mut resp = ui.add(
+                    egui::TextEdit::singleline(&mut state.query)
+                        .hint_text(format!("搜索{}…", state.kind.unit()))
+                        .desired_width(ui.available_width().max(150.0)),
+                );
+                theme::input_menu(&mut resp, &mut state.query, false);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    state.offset = 0;
+                    action = Some(Action::Search(state.kind));
+                }
+            });
         });
     });
     ui.add_space(8.0);
 
     // ---- 第二行：装到哪个实例 + 版本 + 排序 ----
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("安装到").size(11.5).color(theme::TEXT_WEAK));
-        ui.add_space(2.0);
-        let current = state
-            .target
-            .clone()
-            .unwrap_or_else(|| "（还没有装好的实例）".to_string());
-        let enabled = !instances.is_empty();
-        ui.add_enabled_ui(enabled, |ui| {
-            let combo = egui::ComboBox::from_id_salt("res-target")
-                .selected_text(RichText::new(current).size(12.0))
-                .width(220.0)
-                .show_ui(ui, |ui| {
-                    for name in instances {
-                        let picked = state.target.as_deref() == Some(name.as_str());
-                        if ui.selectable_label(picked, name).clicked() {
-                            state.target = Some(name.clone());
+    let second = theme::slide_progress(head, theme::TOOLBAR_2_SLIDE_DELAY, theme::TITLE_SLIDE_SECS);
+    theme::title_slide(ui, second, |ui| {
+        ui.horizontal(|ui| {
+            // 整合包不往现有实例里装：它是整个实例的蓝图，下载完另起一个。
+            // 摆一个「安装到」下拉只会让人以为选中的那个会被改动。
+            if state.kind.installs_into_instance() {
+                ui.label(RichText::new("安装到").size(11.5).color(theme::TEXT_WEAK));
+                ui.add_space(2.0);
+                let current = state
+                    .target
+                    .clone()
+                    .unwrap_or_else(|| "（还没有装好的实例）".to_string());
+                let enabled = !instances.is_empty();
+                ui.add_enabled_ui(enabled, |ui| {
+                    // 数据包那一行还要塞一个「存档」下拉，实例那个框得让点地方，
+                    // 不然「排序」会被挤到右边界外去。
+                    let target_w = if state.kind.installs_into_world() {
+                        150.0
+                    } else {
+                        220.0
+                    };
+                    let combo = theme::combo_centered(
+                        ui,
+                        "res-target",
+                        RichText::new(current).size(12.0),
+                        target_w,
+                        |ui| {
+                            for name in instances {
+                                let picked = state.target.as_deref() == Some(name.as_str());
+                                if theme::combo_item(ui, picked, name).clicked() {
+                                    state.target = Some(name.clone());
+                                }
+                            }
+                        },
+                    );
+                    theme::hand(combo);
+                });
+                if !enabled {
+                    ui.label(
+                        RichText::new(format!("先装一个游戏版本，{}才有地方放", state.kind.unit()))
+                            .size(11.0)
+                            .color(theme::TEXT_FAINT),
+                    );
+                }
+
+                // 数据包只对某一个存档生效：先挑存档，再说装哪个版本。
+                if state.kind.installs_into_world() {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("存档").size(11.5).color(theme::TEXT_WEAK));
+                    ui.add_space(2.0);
+                    let current = state
+                        .world
+                        .clone()
+                        .unwrap_or_else(|| "（还没有存档）".to_string());
+                    let enabled = !worlds.is_empty();
+                    ui.add_enabled_ui(enabled, |ui| {
+                        let combo = theme::combo_centered(
+                            ui,
+                            "res-world",
+                            RichText::new(current).size(12.0),
+                            130.0,
+                            |ui| {
+                                for name in worlds {
+                                    let picked = state.world.as_deref() == Some(name.as_str());
+                                    if theme::combo_item(ui, picked, name).clicked() {
+                                        state.world = Some(name.clone());
+                                    }
+                                }
+                            },
+                        );
+                        theme::hand(combo);
+                    });
+                    if !enabled {
+                        ui.label(
+                            RichText::new("先把游戏开一次，存档生成后才有地方放数据包")
+                                .size(11.0)
+                                .color(theme::TEXT_FAINT),
+                        );
+                    }
+                }
+
+                // 版本与排序挨在一起：它们是一组语义（看哪个版本、按什么顺序排），
+                // 排在同一行读起来才顺，也把第一行腾给真正的关键词与分类筛选。
+                ui.add_space(12.0);
+            }
+            ui.label(RichText::new("版本").size(11.5).color(theme::TEXT_WEAK));
+            ui.add_space(2.0);
+            let version_label = state
+                .game_version
+                .clone()
+                .unwrap_or_else(|| "全部版本".to_string());
+            let mut picked_version = state.game_version.clone();
+            let combo = theme::combo_centered(
+                ui,
+                "res-version",
+                RichText::new(version_label).size(12.0),
+                112.0,
+                |ui| {
+                    theme::combo_value(ui, &mut picked_version, None, "全部版本");
+                    for version in game_version_choices(instances) {
+                        theme::combo_value(ui, &mut picked_version, Some(version.clone()), &version);
+                    }
+                },
+            );
+            theme::hand(combo);
+            if picked_version != state.game_version {
+                state.game_version = picked_version;
+                dirty = true;
+            }
+
+            ui.add_space(12.0);
+            ui.label(RichText::new("排序").size(11.5).color(theme::TEXT_WEAK));
+            ui.add_space(2.0);
+            let combo = theme::combo_centered(
+                ui,
+                "res-sort",
+                RichText::new(state.sort.label()).size(12.0),
+                104.0,
+                |ui| {
+                    for sort in Sort::ALL {
+                        if theme::combo_value(ui, &mut state.sort, sort, sort.label()).changed() {
+                            dirty = true;
                         }
                     }
-                });
-            theme::hand(combo.response);
-        });
-        if !enabled {
-            ui.label(
-                RichText::new(format!("先装一个游戏版本，{}才有地方放", state.kind.unit()))
-                    .size(11.0)
-                    .color(theme::TEXT_FAINT),
+                },
             );
-        }
-
-        // 版本与排序挨在一起：它们是一组语义（看哪个版本、按什么顺序排），
-        // 排在同一行读起来才顺，也把第一行腾给真正的关键词与分类筛选。
-        ui.add_space(12.0);
-        ui.label(RichText::new("版本").size(11.5).color(theme::TEXT_WEAK));
-        ui.add_space(2.0);
-        let version_label = state
-            .game_version
-            .clone()
-            .unwrap_or_else(|| "全部版本".to_string());
-        let mut picked_version = state.game_version.clone();
-        let combo = egui::ComboBox::from_id_salt("res-version")
-            .selected_text(RichText::new(version_label).size(12.0))
-            .width(112.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut picked_version, None, "全部版本");
-                for version in game_version_choices(instances) {
-                    ui.selectable_value(&mut picked_version, Some(version.clone()), &version);
-                }
-            });
-        theme::hand(combo.response);
-        if picked_version != state.game_version {
-            state.game_version = picked_version;
-            dirty = true;
-        }
-
-        ui.add_space(12.0);
-        ui.label(RichText::new("排序").size(11.5).color(theme::TEXT_WEAK));
-        ui.add_space(2.0);
-        let combo = egui::ComboBox::from_id_salt("res-sort")
-            .selected_text(RichText::new(state.sort.label()).size(12.0))
-            .width(104.0)
-            .show_ui(ui, |ui| {
-                for sort in Sort::ALL {
-                    if ui
-                        .selectable_value(&mut state.sort, sort, sort.label())
-                        .changed()
-                    {
-                        dirty = true;
-                    }
-                }
-            });
-        theme::hand(combo.response);
+            theme::hand(combo);
+        });
     });
     ui.add_space(10.0);
 
@@ -600,8 +765,15 @@ pub fn page(
     }
 
     // ---- 结果列表 ----
-    let list_height = (ui.available_height() - 40.0).max(120.0);
-    egui::ScrollArea::vertical()
+    // 底下只留「第几到第几条 / 每页 / 上一页下一页」那一行的位置：6 像素
+    // 行前间距加一行按钮，34 够用。原先留给 40，滚到底会多出一条白边。
+    let list_height = (ui.available_height() - 34.0).max(120.0);
+    // 逐行进场的当前时刻；None 表示这一批早就进场完了，逐行走普通画法。
+    //
+    // 这里不给延迟：结果是从网上一批批取回来的，到达时刻本来就不定；
+    // 再往后压一截，每次改筛选都要多等一次，划不来。
+    let reveal = theme::row_reveal_elapsed(&mut state.reveal_at, animate, ui.ctx(), 0.0);
+    let list_out = egui::ScrollArea::vertical()
         .id_salt("resources-list")
         .auto_shrink([false, false])
         .max_height(list_height)
@@ -635,12 +807,14 @@ pub fn page(
             ui.spacing_mut().item_spacing.y = 6.0;
             // 分开借两个字段：`hits` 只读，`icons` 要可变（缺图时登记请求）。
             let (hits, icons) = (&state.hits, &mut state.icons);
-            for hit in hits {
-                if row(ui, hit, icons) {
+            for (index, hit) in hits.iter().enumerate() {
+                let opened = theme::reveal_row(ui, index, reveal, |ui| row(ui, hit, icons));
+                if opened {
                     action = Some(Action::OpenDetail(hit.id.clone(), hit.title.clone()));
                 }
             }
         });
+    theme::fade_scrolled(ui, &list_out);
 
     // ---- 翻页 ----
     ui.add_space(6.0);
@@ -651,13 +825,35 @@ pub fn page(
             RichText::new(if state.hits.is_empty() {
                 String::new()
             } else {
-                format!("第 {}–{} 条，共 {}", from, to, state.total)
+                format!("第 {}–{} 条", from, to)
             })
             .size(11.0)
             .color(theme::TEXT_WEAK),
         );
+        ui.add_space(10.0);
+        ui.label(RichText::new("每页").size(11.0).color(theme::TEXT_WEAK));
+        let combo = theme::combo_centered(
+            ui,
+            "res-page-size",
+            RichText::new(state.page_size.to_string()).size(11.5),
+            52.0,
+            |ui| {
+                for size in PAGE_CHOICES {
+                    if theme::combo_value(ui, &mut state.page_size, size, &size.to_string())
+                        .changed()
+                    {
+                        // 换了每页条数就回第一页：停在 offset=200 的空白页上
+                        // 会让人以为「没结果」，其实是每页变少了。
+                        state.offset = 0;
+                        action = Some(Action::Search(state.kind));
+                    }
+                }
+            },
+        );
+        theme::hand(combo);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let next_ok = state.offset + PAGE < state.total as usize && !state.loading;
+            let page = state.page_limit();
+            let next_ok = state.offset + page < state.total as usize && !state.loading;
             if ui
                 .add_enabled(
                     next_ok,
@@ -665,7 +861,7 @@ pub fn page(
                 )
                 .clicked()
             {
-                state.offset += PAGE;
+                state.offset += page;
                 action = Some(Action::Search(state.kind));
             }
             let prev_ok = state.offset > 0 && !state.loading;
@@ -676,7 +872,7 @@ pub fn page(
                 )
                 .clicked()
             {
-                state.offset = state.offset.saturating_sub(PAGE);
+                state.offset = state.offset.saturating_sub(page);
                 action = Some(Action::Search(state.kind));
             }
         });
@@ -809,8 +1005,14 @@ fn link_parts(text: &str) -> Option<(&str, usize)> {
 ///
 /// 数据是 `main.rs` 取回来塞进 `state.detail` 的，这里只负责画；
 /// 还没到的那部分显示「正在加载」，不会挡住先到的那一半。
-fn detail_page(ui: &mut egui::Ui, state: &mut State, busy: Option<&str>) -> Option<Action> {
+fn detail_page(
+    ui: &mut egui::Ui,
+    state: &mut State,
+    worlds: &[String],
+    busy: Option<&str>,
+) -> Option<Action> {
     let target = state.target.clone();
+    let world = state.world.clone();
     let mut picked_file: Option<ModFile> = None;
     let mut open_url: Option<String> = None;
     let mut action = None;
@@ -850,7 +1052,7 @@ fn detail_page(ui: &mut egui::Ui, state: &mut State, busy: Option<&str>) -> Opti
         .max_height(list_height)
         .show(ui, |ui| {
             if let Some(detail) = &view.detail {
-                if let Some(url) = detail_head(ui, detail, icons) {
+                if let Some(url) = detail_head(ui, detail, icons, kind) {
                     open_url = Some(url);
                 }
                 ui.add_space(10.0);
@@ -860,7 +1062,9 @@ fn detail_page(ui: &mut egui::Ui, state: &mut State, busy: Option<&str>) -> Opti
             //
             // 先画筛选（它要可变借用 `view`），再取过滤后的列表：
             // 反过来的话 `versions` 会一直借着 `view` 不放。
-            detail_filters(ui, view, &target, kind);
+            if let Some(picked) = detail_filters(ui, view, &target, &world, worlds, kind) {
+                state.world = Some(picked);
+            }
             ui.add_space(6.0);
 
             let shown = view.visible_versions().len();
@@ -897,7 +1101,10 @@ fn detail_page(ui: &mut egui::Ui, state: &mut State, busy: Option<&str>) -> Opti
             }
 
             ui.spacing_mut().item_spacing.y = 6.0;
-            let can_install = target.is_some() && busy.is_none();
+            // 整合包不需要「装进哪个实例」这个前提：它自己长成一个新实例。
+            let can_install = (target.is_some() || !kind.installs_into_instance())
+                && (world.is_some() || !kind.installs_into_world())
+                && busy.is_none();
 
             // ---- 置顶的那一个 ----
             //
@@ -910,10 +1117,9 @@ fn detail_page(ui: &mut egui::Ui, state: &mut State, busy: Option<&str>) -> Opti
                         .flatten(),
                     pinned: true,
                 };
-                if version_row(ui, version, can_install, &marks) {
-                    if let Some(file) = &version.file {
-                        picked_file = Some(file.clone());
-                    }
+                if version_row(ui, version, can_install, &marks)
+                    && let Some(file) = &version.file {
+                    picked_file = Some(file.clone());
                 }
                 if !groups.is_empty() {
                     ui.add_space(4.0);
@@ -921,23 +1127,20 @@ fn detail_page(ui: &mut egui::Ui, state: &mut State, busy: Option<&str>) -> Opti
             }
 
             // ---- 按游戏版本分组 ----
+            //
+            // 一个分组的表头与它下面那些行共用一张卡片：同一游戏版本的三种
+            // 加载器本来就该读成「一组」，各自一张卡片反而像三件不相干的东西。
             let mut toggle: Option<(String, bool)> = None;
             for group in &groups {
                 let open = view.group_open(&group.game);
-                if group_header(ui, &group.game, group.versions.len(), open).clicked() {
+                let (clicked, picked) =
+                    group_card(ui, &group.game, &group.versions, open, can_install);
+                if clicked {
                     toggle = Some((group.game.clone(), !open));
                 }
-                if open {
-                    ui.add_space(4.0);
-                    for version in &group.versions {
-                        // 分组本身已经说明了游戏版本，行里不再重复打标记
-                        let marks = Marks::default();
-                        if version_row(ui, version, can_install, &marks) {
-                            if let Some(file) = &version.file {
-                                picked_file = Some(file.clone());
-                            }
-                        }
-                    }
+                if let Some(index) = picked
+                    && let Some(file) = &group.versions[index].file {
+                    picked_file = Some(file.clone());
                 }
                 ui.add_space(2.0);
             }
@@ -950,20 +1153,63 @@ fn detail_page(ui: &mut egui::Ui, state: &mut State, busy: Option<&str>) -> Opti
         action = Some(Action::OpenUrl(url));
     }
     if let Some(file) = picked_file {
-        if target.is_none() {
+        if kind.installs_into_instance() && target.is_none() {
             state.notice = Some(("还没有可用的实例，先把游戏版本装好".to_string(), false));
+        } else if kind.installs_into_world() && world.is_none() {
+            state.notice = Some(("还没有存档，先把游戏开一次让它生成".to_string(), false));
         } else if busy.is_some() {
             state.notice = Some(("还有任务在跑，等它结束再装".to_string(), false));
         } else {
             state.notice = Some((format!("正在下载 {}…", file.filename), true));
-            action = Some(Action::InstallFile(file));
+            action = Some(if kind.installs_into_world() {
+                Action::InstallDatapack(file)
+            } else if kind.installs_into_instance() {
+                Action::InstallFile(file)
+            } else {
+                Action::DownloadPack(file)
+            });
         }
     }
     action
 }
 
+/// 详情页里那排外链按钮。
+///
+/// 宽度按文字量出来再留一点余量 —— `dialog_button` 的 `min_width` 是下限
+/// 不是自适应，给死值反而会把长标签截掉。
+fn link_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let width = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            FontId::new(13.5, egui::FontFamily::Proportional),
+            theme::TEXT,
+        )
+        .size()
+        .x
+        + 26.0;
+    theme::dialog_button(ui, label, true, width)
+}
+
+/// 这个项目在 Modrinth 上的主页地址。
+///
+/// 三类东西在站点上分属不同目录，slug 之前那一段就是 `ProjectKind::id()`。
+fn project_page_url(kind: ProjectKind, slug: &str) -> String {
+    format!("https://modrinth.com/{}/{}", kind.id(), slug)
+}
+
+/// MC 模组百科的条目地址。
+fn mcmod_page_url(class_id: &str) -> String {
+    format!("https://www.mcmod.cn/class/{}.html", class_id)
+}
+
 /// 详情页顶部的简介卡片。点了外链就把地址传出去。
-fn detail_head(ui: &mut egui::Ui, detail: &ModDetail, icons: &mut icons::Cache) -> Option<String> {
+fn detail_head(
+    ui: &mut egui::Ui,
+    detail: &ModDetail,
+    icons: &mut icons::Cache,
+    kind: ProjectKind,
+) -> Option<String> {
     let mut opened: Option<String> = None;
     theme::card().show(ui, |ui| {
         let (slot, _) = ui.allocate_exact_size(
@@ -1060,18 +1306,36 @@ fn detail_head(ui: &mut egui::Ui, detail: &ModDetail, icons: &mut icons::Cache) 
                 });
         }
 
-        let links: Vec<(&str, String)> = [
+        // 项目主页和百科页永远排在最前：想看清楚这是个什么东西，
+        // 这两个页面比卡片里这几行字有用得多。
+        // 老接口偶尔不给 slug，那就退回用项目 id：Modrinth 的地址两样都认。
+        let handle = if detail.slug.is_empty() {
+            detail.id.as_str()
+        } else {
+            detail.slug.as_str()
+        };
+        let mut links: Vec<(&str, String)> = vec![
+            ("Modrinth 页面", project_page_url(kind, handle)),
+        ];
+        if kind == ProjectKind::Mod
+            && let Some(id) = aicraft_core::modnames::mcmod_id(&detail.slug) {
+            links.push(("MC 模组百科", mcmod_page_url(id)));
+        }
+        for (label, url) in [
             ("源码", detail.source_url.clone()),
             ("问题反馈", detail.issues_url.clone()),
-        ]
-        .into_iter()
-        .filter_map(|(label, url)| url.map(|u| (label, u)))
-        .collect();
+        ] {
+            if let Some(url) = url {
+                links.push((label, url));
+            }
+        }
         if !links.is_empty() {
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            // 按钮宽度跟着字走：这几个标签长短差得多，一律 84 会把
+            // 「MC 模组百科」挤成省略号。窄窗口里让它们自己换行。
+            ui.horizontal_wrapped(|ui| {
                 for (label, url) in links {
-                    if theme::dialog_button(ui, label, true, 84.0).clicked() {
+                    if link_button(ui, label).clicked() {
                         opened = Some(url);
                     }
                 }
@@ -1082,21 +1346,25 @@ fn detail_head(ui: &mut egui::Ui, detail: &ModDetail, icons: &mut icons::Cache) 
 }
 
 /// 详情页的版本筛选。两张表都在本地列表里找，不重新请求。
+///
+/// 返回玩家在这一排里改出来的存档名（数据包专用；别的类别恒为 `None`）。
 fn detail_filters(
     ui: &mut egui::Ui,
     view: &mut DetailView,
     target: &Option<String>,
+    world: &Option<String>,
+    worlds: &[String],
     kind: ProjectKind,
-) {
+) -> Option<String> {
+    let mut picked_world: Option<String> = None;
     let mut all_loaders: Vec<LoaderKind> = Vec::new();
     let mut all_versions: Vec<String> = Vec::new();
     if let Some(all) = &view.versions {
         for v in all {
             for l in &v.loaders {
-                if let Some(kind) = LoaderKind::from_id(l) {
-                    if !all_loaders.contains(&kind) {
-                        all_loaders.push(kind);
-                    }
+                if let Some(kind) = LoaderKind::from_id(l)
+                    && !all_loaders.contains(&kind) {
+                    all_loaders.push(kind);
                 }
             }
             for gv in &v.game_versions {
@@ -1116,63 +1384,150 @@ fn detail_filters(
                 .loader
                 .map(|l| l.label().to_string())
                 .unwrap_or_else(|| "全部加载器".to_string());
-            let combo = egui::ComboBox::from_id_salt("res-detail-loader")
-                .selected_text(RichText::new(loader_label).size(12.0))
-                .width(112.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut view.loader, None, "全部加载器");
+            let combo = theme::combo_centered(
+                ui,
+                "res-detail-loader",
+                RichText::new(loader_label).size(12.0),
+                112.0,
+                |ui| {
+                    theme::combo_value(ui, &mut view.loader, None, "全部加载器");
                     for kind in &all_loaders {
-                        ui.selectable_value(&mut view.loader, Some(*kind), kind.label());
+                        theme::combo_value(ui, &mut view.loader, Some(*kind), kind.label());
                     }
-                });
-            theme::hand(combo.response);
+                },
+            );
+            theme::hand(combo);
         }
 
         let version_label = view
             .game_version
             .clone()
             .unwrap_or_else(|| "全部版本".to_string());
-        let combo = egui::ComboBox::from_id_salt("res-detail-version")
-            .selected_text(RichText::new(version_label).size(12.0))
-            .width(112.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut view.game_version, None, "全部版本");
+        let combo = theme::combo_centered(
+            ui,
+            "res-detail-version",
+            RichText::new(version_label).size(12.0),
+            112.0,
+            |ui| {
+                theme::combo_value(ui, &mut view.game_version, None, "全部版本");
                 for gv in &all_versions {
-                    ui.selectable_value(&mut view.game_version, Some(gv.clone()), gv);
+                    theme::combo_value(ui, &mut view.game_version, Some(gv.clone()), gv);
                 }
-            });
-        theme::hand(combo.response);
+            },
+        );
+        theme::hand(combo);
 
-        if let Some(t) = target {
+
+        // 数据包要挑存档，这里也放一个：进详情页之后发现挑错了，
+        // 不必退回列表页再改一次。
+        if kind.installs_into_world() {
+            let current = world
+                .clone()
+                .unwrap_or_else(|| "（还没有存档）".to_string());
+            let enabled = !worlds.is_empty();
+            let mut choice = world.clone();
+            ui.add_enabled_ui(enabled, |ui| {
+                let combo = theme::combo_centered(
+                    ui,
+                    "res-detail-world",
+                    RichText::new(current).size(12.0),
+                    150.0,
+                    |ui| {
+                        for name in worlds {
+                            theme::combo_value(ui, &mut choice, Some(name.clone()), name);
+                        }
+                    },
+                );
+                theme::hand(combo);
+            });
+            if choice != *world {
+                picked_world = choice;
+            }
+        }
+
+        // 整合包不会装进任何现有实例，说「装进 X」是在骗人。
+        if let Some(t) = target.as_ref().filter(|_| kind.installs_into_instance()) {
             ui.add_space(6.0);
+            let where_to = match world.as_ref().filter(|_| kind.installs_into_world()) {
+                Some(w) => format!("装进 {} / {}", t, w),
+                None => format!("装进 {}", t),
+            };
             ui.label(
-                RichText::new(format!("装进 {}", t))
+                RichText::new(where_to)
                     .size(11.0)
                     .color(theme::TEXT_FAINT),
             );
         }
     });
+    picked_world
 }
 
-/// 一个游戏版本分组的标题栏：`▸ 1.21.1　12 个版本`。
+/// 分组卡片的表头高度。
+const GROUP_HEAD_H: f32 = 34.0;
+
+/// 分组卡片里一行版本的高度。
+///
+/// 比独立卡片（54）矮两像素：行与行之间靠细线分隔，不再各留一圈边距。
+const GROUP_ROW_H: f32 = 52.0;
+
+/// 展开的分组底部留的那点白。
+const GROUP_PAD_H: f32 = 4.0;
+
+/// 一个游戏版本分组的整张卡片：表头 `▸ 1.21.1　12 个版本` 加（展开时的）若干行。
 ///
 /// `open` 传进来是当前状态，点一下就变成 `!open`；调用方拿返回值去写回
 /// `DetailView::toggled`（不能在里面改，那个 `HashMap` 属于 `view`，
 /// 而这里正借着它读版本列表）。
-fn group_header(ui: &mut egui::Ui, game: &str, count: usize, open: bool) -> egui::Response {
-    let (slot, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+///
+/// 返回 `(表头被点了吗, 点了下载的是第几行)`。
+fn group_card(
+    ui: &mut egui::Ui,
+    game: &str,
+    versions: &[&ModVersion],
+    open: bool,
+    can_install: bool,
+) -> (bool, Option<usize>) {
+    let width = ui.available_width();
+    let shown = if open { versions.len() } else { 0 };
+    let height = GROUP_HEAD_H
+        + GROUP_ROW_H * shown as f32
+        + if open { GROUP_PAD_H } else { 0.0 };
+    let (slot, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
     let rect = slot.shrink2(Vec2::new(0.0, 1.0));
-    let fill = if response.hovered() {
-        theme::BG_BOTTOM
-    } else {
-        theme::CARD
-    };
-    ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(10), theme::card_fill());
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(10),
+        Stroke::new(1.0, theme::BORDER),
+        StrokeKind::Inside,
+    );
 
-    let inner = rect.shrink2(Vec2::new(12.0, 6.0));
+    // ---- 表头：整条都能点，点了收起 / 展开 ----
+    let head_rect = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width(), GROUP_HEAD_H));
+    let response = ui.interact(
+        head_rect,
+        ui.scope_id().with(("res-group", game)),
+        Sense::click(),
+    );
+    if response.hovered() {
+        // 只亮表头那一块：整张卡片跟着高亮会让人分不清点的是表头还是某一行。
+        ui.painter().rect_filled(
+            head_rect.shrink(1.0),
+            CornerRadius {
+                nw: 9,
+                ne: 9,
+                sw: 0,
+                se: 0,
+            },
+            theme::BG_BOTTOM,
+        );
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let inner = head_rect.shrink2(Vec2::new(12.0, 0.0));
     // 三角用画的不塞字符：`▶`/`▸` 在中文字体里有没有全看运气
-    let tri = egui::pos2(inner.left() + 4.0, inner.center().y);
+    let tri = egui::pos2(inner.left() + 4.0, head_rect.center().y);
     let color = theme::TEXT_WEAK;
     let points = if open {
         vec![
@@ -1192,7 +1547,7 @@ fn group_header(ui: &mut egui::Ui, game: &str, count: usize, open: bool) -> egui
 
     let text_left = inner.left() + 16.0;
     ui.painter().text(
-        egui::pos2(text_left, inner.center().y),
+        egui::pos2(text_left, head_rect.center().y),
         Align2::LEFT_CENTER,
         game,
         FontId::new(12.5, egui::FontFamily::Proportional),
@@ -1204,16 +1559,46 @@ fn group_header(ui: &mut egui::Ui, game: &str, count: usize, open: bool) -> egui
         theme::TEXT,
     );
     ui.painter().text(
-        egui::pos2(text_left + galley.size().x + 8.0, inner.center().y),
+        egui::pos2(text_left + galley.size().x + 8.0, head_rect.center().y),
         Align2::LEFT_CENTER,
-        format!("{} 个版本", count),
+        format!("{} 个版本", versions.len()),
         FontId::proportional(10.5),
         theme::TEXT_FAINT,
     );
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+
+    // ---- 展开的那些行：同一张卡片里，行与行之间只隔一条细线 ----
+    let mut picked = None;
+    if open {
+        let line = Stroke::new(1.0, theme::BORDER);
+        for (index, version) in versions.iter().enumerate() {
+            let top = head_rect.max.y + GROUP_ROW_H * index as f32;
+            let row = egui::Rect::from_min_size(
+                egui::pos2(rect.left(), top),
+                Vec2::new(rect.width(), GROUP_ROW_H),
+            );
+            // 表头下面那条线由第一条自己的上沿画，免得两处各画一条、叠成两像素
+            ui.painter().line_segment(
+                [
+                    egui::pos2(rect.left() + 12.0, top),
+                    egui::pos2(rect.max.x - 12.0, top),
+                ],
+                line,
+            );
+            // 分组本身已经说明了游戏版本，行里不再重复打标记
+            if draw_version_row(
+                ui,
+                row.shrink2(Vec2::new(0.0, 1.0)),
+                None,
+                version,
+                can_install,
+                &Marks::default(),
+            ) {
+                picked = Some(index);
+            }
+        }
     }
-    response
+
+    (response.clicked(), picked)
 }
 
 /// 一行版本要打的标记。
@@ -1280,29 +1665,70 @@ fn badge(
     width
 }
 
-/// 版本列表里的一行。点「下载」返回 `true`。
+/// 版本列表里一个独立的行（置顶那一条）：自己是一张卡片。点「下载」返回 `true`。
 fn version_row(ui: &mut egui::Ui, version: &ModVersion, can_install: bool, marks: &Marks) -> bool {
     let (slot, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 54.0), Sense::click());
     let rect = slot.shrink2(Vec2::new(0.0, 1.0));
-    let fill = if response.hovered() {
-        theme::CARD_HOVER
-    } else {
-        theme::CARD
+    draw_version_row(ui, rect, Some(&response), version, can_install, marks)
+}
+
+/// 在给定矩形里画一行版本。
+///
+/// `hover` 传 `Some` 时按「自己占一整张卡片」的画法（悬停换底色、四周描边）；
+/// 分组卡片里的行传 `None`：它们共用外层那一张卡片，悬停只让文字那一块亮一下，
+/// 描边交给分组去画——每行各描一圈会把一张卡片切成一摞卡片。
+fn draw_version_row(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    hover: Option<&egui::Response>,
+    version: &ModVersion,
+    can_install: bool,
+    marks: &Marks,
+) -> bool {
+    let response = match hover {
+        Some(response) => response.clone(),
+        None => ui.interact(rect, ui.scope_id().with(("res-line", &version.id)), Sense::click()),
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
     // 能装进当前实例的那几行描边用主题色，扫一眼就知道该点哪几行
     let border = if marks.matched_game.is_some() {
-        theme::ACCENT
+        theme::accent_fill()
     } else {
         theme::BORDER
     };
-    ui.painter().rect_stroke(
-        rect,
-        CornerRadius::same(10),
-        Stroke::new(1.0, border),
-        StrokeKind::Inside,
-    );
+    if hover.is_some() {
+        let fill = if response.hovered() {
+            theme::CARD_HOVER
+        } else {
+            theme::card_fill()
+        };
+        ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(10),
+            Stroke::new(1.0, border),
+            StrokeKind::Inside,
+        );
+    } else if response.hovered() {
+        // 分组里的行：整张卡片已经铺好了白底，这里只把指针下那一行点亮。
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(8), theme::CARD_HOVER);
+        if marks.matched_game.is_some() {
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::same(8),
+                Stroke::new(1.0, border),
+                StrokeKind::Inside,
+            );
+        }
+    } else if marks.matched_game.is_some() {
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(8),
+            Stroke::new(1.0, border),
+            StrokeKind::Inside,
+        );
+    }
     let inner = rect.shrink2(Vec2::new(14.0, 8.0));
     let left_width = (inner.width() - 92.0).max(60.0);
 
@@ -1312,8 +1738,8 @@ fn version_row(ui: &mut egui::Ui, version: &ModVersion, can_install: bool, marks
     if marks.pinned {
         badges.push((
             PINNED_LABEL.to_string(),
-            theme::ACCENT_SOFT,
-            theme::ACCENT_STRONG,
+            theme::accent_soft(),
+            theme::accent_strong(),
         ));
     }
     let badge_total: f32 = badges
@@ -1409,9 +1835,9 @@ fn version_row(ui: &mut egui::Ui, version: &ModVersion, can_install: bool, marks
     let fill = if !enabled {
         theme::BORDER
     } else if hovered {
-        theme::ACCENT_STRONG
+        theme::accent_strong()
     } else {
-        theme::ACCENT
+        theme::accent_fill()
     };
     ui.painter()
         .rect_filled(button_rect, CornerRadius::same(6), fill);
@@ -1425,7 +1851,7 @@ fn version_row(ui: &mut egui::Ui, version: &ModVersion, can_install: bool, marks
         },
         FontId::proportional(11.5),
         if enabled {
-            Color32::WHITE
+            theme::accent_ink()
         } else {
             theme::TEXT_FAINT
         },
@@ -1473,7 +1899,7 @@ fn row(ui: &mut egui::Ui, hit: &ModHit, icons: &mut icons::Cache) -> bool {
     let fill = if response.hovered() {
         theme::CARD_HOVER
     } else {
-        theme::CARD
+        theme::card_fill()
     };
     ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
     ui.painter().rect_stroke(
@@ -1684,17 +2110,45 @@ mod tests {
     fn target_falls_back_to_the_first_instance() {
         let mut state = State::default();
         let instances = vec!["a".to_string(), "b".to_string()];
-        state.pick_target(&instances);
+        state.pick_target(&instances, None);
         assert_eq!(state.target.as_deref(), Some("a"));
 
         // 选过的实例还在，就不该被换掉
         state.target = Some("b".to_string());
-        state.pick_target(&instances);
+        state.pick_target(&instances, None);
         assert_eq!(state.target.as_deref(), Some("b"));
 
         // 实例没了才回退
-        state.pick_target(&[]);
+        state.pick_target(&[], None);
         assert_eq!(state.target, None);
+    }
+
+    /// 安装目标跟着主页走：主页换版本，这里跟着换。
+    #[test]
+    fn target_follows_the_version_chosen_at_home() {
+        let mut state = State::default();
+        let instances = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        state.pick_target(&instances, Some("c"));
+        assert_eq!(state.target.as_deref(), Some("c"), "该落到主页选中的版本");
+
+        // 主页换了版本，安装目标跟着换
+        state.pick_target(&instances, Some("a"));
+        assert_eq!(state.target.as_deref(), Some("a"), "主页换了就得跟着换");
+
+        // 主页没换时，玩家在下拉里自己挑的要留着
+        state.target = Some("b".to_string());
+        state.pick_target(&instances, Some("a"));
+        assert_eq!(state.target.as_deref(), Some("b"), "主页没动就别顶掉手选");
+
+        // 主页选中的那个没装成实例（或者已经被删）就退回第一个
+        let mut fresh = State::default();
+        fresh.pick_target(&instances, Some("missing"));
+        assert_eq!(fresh.target.as_deref(), Some("a"));
+
+        // 压根没有已装实例时保持空
+        let mut empty = State::default();
+        empty.pick_target(&[], Some("c"));
+        assert_eq!(empty.target, None);
     }
 
     fn version(number: &str, loaders: &[&str], gv: &[&str]) -> ModVersion {
@@ -1785,6 +2239,18 @@ world"
         // 版本列表还没回来时不该报错，也不该显示「没有版本」
         let empty = DetailView::new("p".to_string(), "x".to_string());
         assert!(empty.visible_versions().is_empty());
+    }
+
+    #[test]
+    fn each_kind_links_to_its_own_modrinth_section() {
+        assert_eq!(project_page_url(ProjectKind::Mod, "sodium"), "https://modrinth.com/mod/sodium");
+        assert_eq!(project_page_url(ProjectKind::ResourcePack, "x"), "https://modrinth.com/resourcepack/x");
+        assert_eq!(project_page_url(ProjectKind::Shader, "y"), "https://modrinth.com/shader/y");
+    }
+
+    #[test]
+    fn a_wiki_entry_becomes_a_class_page() {
+        assert_eq!(mcmod_page_url("2021"), "https://www.mcmod.cn/class/2021.html");
     }
 
     #[test]
@@ -1938,6 +2404,43 @@ world"
     }
 
     #[test]
+    fn the_world_falls_back_but_keeps_a_manual_pick() {
+        let mut state = State::default();
+        assert_eq!(state.world, None, "还没挑过就是空的");
+
+        state.pick_world(&["world".to_string(), "second".to_string()]);
+        assert_eq!(state.world.as_deref(), Some("world"), "默认挑第一个");
+
+        state.world = Some("second".to_string());
+        state.pick_world(&["world".to_string(), "second".to_string()]);
+        assert_eq!(state.world.as_deref(), Some("second"), "手挑的要留着");
+
+        state.pick_world(&["fresh".to_string()]);
+        assert_eq!(state.world.as_deref(), Some("fresh"), "存档没了就退回第一个");
+
+        state.pick_world(&[]);
+        assert_eq!(state.world, None, "一个存档都没有时清空");
+    }
+
+    #[test]
+    fn datapacks_need_a_world_before_they_can_be_installed() {
+        for kind in ProjectKind::ALL {
+            let state = State {
+                kind,
+                ..State::default()
+            };
+            // 只有数据包要求先挑存档
+            assert_eq!(
+                kind.installs_into_world(),
+                kind == ProjectKind::Datapack,
+                "{:?}",
+                kind
+            );
+            assert_eq!(state.world, None, "{:?} 一开始都没有存档", kind);
+        }
+    }
+
+    #[test]
     fn each_kind_queries_its_own_project_type() {
         for kind in ProjectKind::ALL {
             let state = State {
@@ -1986,12 +2489,54 @@ world"
         assert!(state.needs_fetch());
     }
 
+    /// 每页条数只在候选表里取值；表外的（旧状态、手改的配置）退回默认。
+    #[test]
+    fn the_page_size_stays_on_the_menu() {
+        let mut state = State::default();
+        assert_eq!(state.page_size, 20);
+        for size in [5, 10, 15, 20, 50, 100] {
+            state.page_size = size;
+            assert_eq!(state.page_limit(), size, "{} 该原样用", size);
+            assert_eq!(state.query_spec().limit, size);
+        }
+        state.page_size = 7;
+        assert_eq!(state.page_limit(), 20, "表外的条数退回默认");
+        state.page_size = 0;
+        assert_eq!(state.page_limit(), 20);
+    }
+
+    #[test]
+    fn the_modpack_tab_does_not_ask_which_instance_to_install_into() {
+        let mut state = State {
+            kind: ProjectKind::Modpack,
+            ..State::default()
+        };
+        // 整合包自己长成一个实例，这一维对它没有意义
+        assert!(!state.kind.installs_into_instance());
+        assert!(!state.filter_text().contains("加载器"));
+        assert!(state.filter_text().contains("整合包下载"));
+        // 从模组切到整合包时，上一类的加载器条件要清掉，别带过去
+        state.kind = ProjectKind::Mod;
+        state.loader = Some(LoaderKind::Fabric);
+        state.switch_kind(ProjectKind::Modpack);
+        assert_eq!(state.loader, None);
+    }
+
+    #[test]
+    fn a_modpack_version_is_a_download_not_an_install() {
+        // 三类东西里只有整合包走「下载 → 导入」这条路
+        assert!(ProjectKind::Mod.installs_into_instance());
+        assert!(ProjectKind::ResourcePack.installs_into_instance());
+        assert!(ProjectKind::Shader.installs_into_instance());
+        assert!(!ProjectKind::Modpack.installs_into_instance());
+    }
+
     #[test]
     fn queries_start_on_the_first_page() {
         let state = State::default();
         let spec = state.query_spec();
         assert_eq!(spec.offset, 0);
-        assert_eq!(spec.limit, PAGE);
+        assert_eq!(spec.limit, DEFAULT_PAGE, "默认每页 20 条");
         assert_eq!(spec.category.as_deref(), Some(""));
         assert_eq!(spec.loader, None);
         assert_eq!(spec.game_version, None);

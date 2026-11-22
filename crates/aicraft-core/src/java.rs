@@ -81,6 +81,24 @@ impl std::fmt::Display for JavaError {
 
 impl std::error::Error for JavaError {}
 
+/// 把 `javaw.exe` 换成同目录的 `java.exe`。
+///
+/// 安装器（Forge / NeoForge / 服务端）要把 `-version` 和报错读回来，
+/// 而 `javaw` 是窗口子系统、没有标准输出，用它跑只能看到一片空白。
+/// 同目录没有 `java.exe` 就原样返回：宁可读不到输出，也别给出一个不存在的路径。
+pub fn console_java(path: &Path) -> PathBuf {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if !name.eq_ignore_ascii_case("javaw.exe") {
+        return path.to_path_buf();
+    }
+    let sibling = path.with_file_name("java.exe");
+    if sibling.is_file() {
+        sibling
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// 从 java 可执行文件读取版本信息。
 pub fn probe_java(java_path: &Path) -> Option<JavaRuntime> {
     let output = crate::spawn::silent(java_path).arg("-version").output().ok()?;
@@ -168,6 +186,13 @@ pub fn candidate_paths() -> Vec<(PathBuf, String)> {
         roots.push(PathBuf::from("/usr/libexec/java_home"));
     } else {
         roots.push(PathBuf::from("/usr/lib/jvm"));
+    }
+
+    // 启动器自己下过的那几个（见 `crate::javadl`）。
+    // 放在常见安装目录之后：玩家自己装的 JDK 优先，我们下的只作补充。
+    let managed = crate::javadl::managed_root();
+    if managed.is_dir() {
+        roots.push(managed);
     }
 
     for root in roots {

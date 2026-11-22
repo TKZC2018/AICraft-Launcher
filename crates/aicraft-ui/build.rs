@@ -58,10 +58,9 @@ fn main() {
 
 /// 依次尝试：环境变量 `RC`、Windows SDK 里版本号最高的一份 x64/arm64 rc.exe。
 fn find_rc() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("RC").map(PathBuf::from) {
-        if path.is_file() {
-            return Some(path);
-        }
+    if let Some(path) = std::env::var_os("RC").map(PathBuf::from)
+        && path.is_file() {
+        return Some(path);
     }
 
     let arch = match std::env::consts::ARCH {

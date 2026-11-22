@@ -55,23 +55,32 @@ impl Sort {
     }
 }
 
-/// 资源下载能搜的三类东西。
+/// 资源下载能搜的四类东西。
 ///
-/// Modrinth 用一个 `project_type` 区分它们（`mod` / `resourcepack` / `shader`），
-/// 三者能用的分类、落盘目录都不一样，所以这里一并带上。
+/// Modrinth 用一个 `project_type` 区分它们（`mod` / `resourcepack` /
+/// `shader` / `modpack`），四者能用的分类、落盘去向都不一样，所以这里
+/// 一并带上。整合包是个例外：它不放进任何现有实例，而是装成一个新的，
+/// 所以它没有「子目录」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ProjectKind {
     #[default]
     Mod,
     ResourcePack,
     Shader,
+    /// 数据包。Modrinth 没有独立的 `project_type`，但 facets 认
+    /// `project_type:datapack`（它按项目的 `all_project_types` 筛），
+    /// 站点上的目录也叫 `/datapack/<slug>`，所以 `id()` 照样能用。
+    Datapack,
+    Modpack,
 }
 
 impl ProjectKind {
-    pub const ALL: [ProjectKind; 3] = [
+    pub const ALL: [ProjectKind; 5] = [
         ProjectKind::Mod,
         ProjectKind::ResourcePack,
         ProjectKind::Shader,
+        ProjectKind::Datapack,
+        ProjectKind::Modpack,
     ];
 
     /// Modrinth 的 `project_type` 取值。
@@ -80,6 +89,8 @@ impl ProjectKind {
             ProjectKind::Mod => "mod",
             ProjectKind::ResourcePack => "resourcepack",
             ProjectKind::Shader => "shader",
+            ProjectKind::Datapack => "datapack",
+            ProjectKind::Modpack => "modpack",
         }
     }
 
@@ -89,10 +100,12 @@ impl ProjectKind {
             ProjectKind::Mod => "模组下载",
             ProjectKind::ResourcePack => "资源包下载",
             ProjectKind::Shader => "光影包下载",
+            ProjectKind::Datapack => "数据包下载",
+            ProjectKind::Modpack => "整合包下载",
         }
     }
 
-    /// 单个东西的量词：一个模组 / 一个资源包 / 一个光影包。
+    /// 单个东西的量词：一个模组 / 一个资源包 / 一个光影包 / 一个整合包。
     ///
     /// 「共 1234 个模组」里的「个」不是恒定的，「一个光影包」念着顺，
     /// 拼句子时直接用这个字更省事。
@@ -101,29 +114,60 @@ impl ProjectKind {
             ProjectKind::Mod => "模组",
             ProjectKind::ResourcePack => "资源包",
             ProjectKind::Shader => "光影包",
+            ProjectKind::Datapack => "数据包",
+            ProjectKind::Modpack => "整合包",
         }
     }
 
     /// 这个扩展名的文件算不算这一类的东西。
     ///
     /// 模组只收 `.jar`；资源包与光影包只收 `.zip`（Modrinth 上它们就是
-    /// 这么上传的）。宽松一点会把作者顺手传的 `.mrpack`、`-sources.jar`
-    /// 也列出来，点下去装进游戏的是个读不了的文件。
+    /// 这么上传的）；整合包只收 `.mrpack`。宽松一点会把作者顺手传的
+    /// `.mrpack`、`-sources.jar` 也列出来，点下去装进游戏的是个读不了的文件。
     pub fn accepts(self, filename: &str) -> bool {
         let name = filename.to_ascii_lowercase();
         match self {
             ProjectKind::Mod => name.ends_with(".jar"),
-            ProjectKind::ResourcePack | ProjectKind::Shader => name.ends_with(".zip"),
+            // 数据包和资源包一样是 zip；同一个 Modrinth 版本里常同时有
+            // 「数据包 zip」和「模组 jar」，收窄到 zip 才不会把 jar 当成数据包。
+            ProjectKind::ResourcePack | ProjectKind::Shader | ProjectKind::Datapack => {
+                name.ends_with(".zip")
+            }
+            ProjectKind::Modpack => name.ends_with(".mrpack"),
         }
     }
 
-    /// 装进实例的哪个子目录。
-    pub fn dir(self) -> &'static str {
+    /// 装进实例的哪个子目录；`None` 表示「不装进现有实例」。
+    ///
+    /// 整合包下载完之后走的是导入流程：新建一个实例再往里铺文件，
+    /// 所以它没有可以塞进去的子目录。
+    pub fn dir(self) -> Option<&'static str> {
         match self {
-            ProjectKind::Mod => "mods",
-            ProjectKind::ResourcePack => "resourcepacks",
-            ProjectKind::Shader => "shaderpacks",
+            ProjectKind::Mod => Some("mods"),
+            ProjectKind::ResourcePack => Some("resourcepacks"),
+            ProjectKind::Shader => Some("shaderpacks"),
+            // 数据包不落在实例根：真正生效的位置是某个存档里的
+            // `saves/<存档>/datapacks`，所以它跟整合包一样「不塞进实例根」，
+            // 由调用方另外挑一个存档（见 `datapack_dir`）。
+            ProjectKind::Datapack => None,
+            ProjectKind::Modpack => None,
         }
+    }
+
+    /// 这一类是不是「挑一个存档，放进存档的 datapacks 里」。
+    pub fn installs_into_world(self) -> bool {
+        self == ProjectKind::Datapack
+    }
+
+    /// 这一类是不是「放进某个现有实例」的东西。
+    ///
+    /// 界面上靠它决定要不要摆「安装到」那个下拉框：整合包装成一个新实例，
+    /// 让玩家挑「装进哪个」只会让他以为选错了地方。
+    ///
+    /// 数据包虽然不进实例根（dir() 是 None），但它确实要落在某个实例的
+    /// saves/<存档>/datapacks 里，所以这里算「是」——它只是还要再挑存档。
+    pub fn installs_into_instance(self) -> bool {
+        self.dir().is_some() || self.installs_into_world()
     }
 
     /// 这一类的分类下拉表，第一项永远是「全部分类」。
@@ -132,6 +176,8 @@ impl ProjectKind {
             ProjectKind::Mod => &MOD_CATEGORIES,
             ProjectKind::ResourcePack => &PACK_CATEGORIES,
             ProjectKind::Shader => &SHADER_CATEGORIES,
+            ProjectKind::Datapack => &DATAPACK_CATEGORIES,
+            ProjectKind::Modpack => &MODPACK_CATEGORIES,
         }
     }
 
@@ -147,7 +193,13 @@ impl ProjectKind {
 
 /// 查一个分类短名的中文名。三张表都翻，查不到返回 `None`。
 pub fn category_label(id: &str) -> Option<&'static str> {
-    let tables: [&[(&str, &str)]; 3] = [&MOD_CATEGORIES, &PACK_CATEGORIES, &SHADER_CATEGORIES];
+    let tables: [&[(&str, &str)]; 5] = [
+        &MOD_CATEGORIES,
+        &PACK_CATEGORIES,
+        &SHADER_CATEGORIES,
+        &DATAPACK_CATEGORIES,
+        &MODPACK_CATEGORIES,
+    ];
     for table in tables {
         if let Some((_, label)) = table.iter().find(|(key, _)| *key == id) {
             return Some(label);
@@ -226,6 +278,51 @@ const SHADER_CATEGORIES: [(&str, &str); 20] = [
     ("high", "高开销"),
     ("potato", "土豆机可跑"),
     ("screenshot", "截图专用"),
+];
+
+/// 数据包分类：玩法向的居多，分辨率那类完全用不上。
+///
+/// Modrinth 没有单独的 datapack 分类表（它的分类是按 `project_type` 分的），
+/// 所以这张表是从模组/服务器那两张里挑出数据包真会用到的那部分——
+/// 分类短名本身仍然由站点校验，挑错了只是筛不出东西。
+const DATAPACK_CATEGORIES: [(&str, &str); 17] = [
+    ("", "全部分类"),
+    ("adventure", "冒险"),
+    ("decoration", "装饰"),
+    ("economy", "经济"),
+    ("equipment", "装备"),
+    ("food", "食物"),
+    ("game-mechanics", "机制改动"),
+    ("library", "前置库"),
+    ("magic", "魔法"),
+    ("mobs", "生物"),
+    ("optimization", "性能优化"),
+    ("social", "社交"),
+    ("storage", "存储"),
+    ("technology", "科技"),
+    ("utilities", "实用工具"),
+    ("worldgen", "世界生成"),
+    ("cursed", "邪门"),
+];
+
+/// 整合包分类：按玩法流派分，和模组那套不完全重合。
+///
+/// 「多模组」「轻量」这类只在整合包上才说得通，所以单独一张表，
+/// 不往模组那张里塞。
+const MODPACK_CATEGORIES: [(&str, &str); 13] = [
+    ("", "全部分类"),
+    ("adventure", "冒险"),
+    ("combat", "战斗"),
+    ("kitchen-sink", "大杂烩"),
+    ("lightweight", "轻量"),
+    ("magic", "魔法"),
+    ("multiplayer", "多人"),
+    ("optimization", "性能优化"),
+    ("quests", "任务线"),
+    ("technology", "科技"),
+    ("worldgen", "世界生成"),
+    ("challenging", "硬核"),
+    ("cursed", "邪门"),
 ];
 
 /// 搜索命中的一个模组。
@@ -463,7 +560,12 @@ pub fn install_file(
     kind: ProjectKind,
     file: &ModFile,
 ) -> Result<PathBuf, String> {
-    let sub = kind.dir();
+    let Some(sub) = kind.dir() else {
+        return Err(format!(
+            "{}不是放进实例的东西，它要装成一个新的",
+            kind.unit()
+        ));
+    };
     let dir = content_dir(game_dir, instance, sub);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("建 {} 目录失败（{}）: {}", sub, dir.display(), e))?;
@@ -473,6 +575,38 @@ pub fn install_file(
     Ok(dest)
 }
 
+/// 把一个整合包下载到暂存目录，返回落到盘上的路径。
+///
+/// 整合包不能像模组那样「下到 mods/ 里就完事」：它是整个实例的蓝图，
+/// 下完还要读清单、确认实例名、铺文件。所以这里只负责把它取回来，
+/// 放在 `<暂存目录>/整合包/` 下，交给导入流程接手。
+///
+/// 同名文件已经在了就覆盖：玩家点第二次通常是因为第一次没成，
+/// 而不是想要两份一模一样的包。
+pub fn download_pack(staging: &Path, file: &ModFile) -> Result<PathBuf, String> {
+    let dir = staging.join("整合包");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("建暂存目录失败（{}）: {}", dir.display(), e))?;
+    let dest = dir.join(&file.filename);
+    crate::transport::download_to(&file.url, &dest, file.sha1.as_deref())
+        .map_err(|e| format!("下载 {} 失败: {}", file.filename, e))?;
+    Ok(dest)
+}
+
+/// 导入成功之后，把暂存的那份整合包删掉。
+///
+/// 整合包动辄几百兆，装完还留在暂存目录里只是白占地方；同名再下会覆盖，
+/// 所以删掉不丢东西。
+///
+/// 删不掉不算错：Windows 上文件被别的程序占着是常事，而导入本身已经成功了，
+/// 不该因为收尾失败去报一个假错误。目录只在整个空了之后才收掉。
+pub fn discard_pack(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
 /// 模组详情页上要显示的东西。
 ///
 /// 比 [`ModHit`] 多的是长描述（`body`，Modrinth 里是 markdown 原文）、
@@ -480,6 +614,9 @@ pub fn install_file(
 #[derive(Debug, Clone, Default)]
 pub struct ModDetail {
     pub id: String,
+    /// 短的 URL 名。拼「在 Modrinth 上打开」的地址要用它，
+    /// 比 id 好读，而且换了 id 也还是这个地址。
+    pub slug: String,
     pub title: String,
     pub description: String,
     /// 长描述原文（markdown）。界面按纯文本显示，不做渲染——
@@ -589,6 +726,7 @@ pub fn parse_detail(text: &str) -> Result<ModDetail, String> {
                 .collect()
         });
     Ok(ModDetail {
+        slug: text_of(&root, "slug"),
         id,
         title: text_of(&root, "title"),
         description: text_of(&root, "description"),
@@ -706,6 +844,52 @@ pub fn content_dir(game_dir: &Path, instance: &str, sub: &str) -> PathBuf {
         }
         crate::instance::InstanceMode::Shared => game_dir.join(sub),
     }
+}
+
+/// 一个实例下的所有存档名（`saves/` 里的子目录）。
+///
+/// 数据包只能塞进某个存档，所以界面得先把能选的存档列出来。
+pub fn list_worlds(game_dir: &Path, instance: &str) -> Vec<String> {
+    crate::instance::list_dirs(&content_dir(game_dir, instance, "saves"))
+        .into_iter()
+        .map(|item| item.name)
+        .collect()
+}
+
+/// 某个存档的 `datapacks/` 目录。
+///
+/// 数据包真正的落点是**存档里**：`<实例>/saves/<存档>/datapacks/`。
+/// 放在实例根的 `datapacks/` 原版游戏根本不读，所以这里必须带上存档名。
+pub fn datapack_dir(game_dir: &Path, instance: &str, world: &str) -> PathBuf {
+    content_dir(game_dir, instance, "saves")
+        .join(world)
+        .join("datapacks")
+}
+
+/// 把一个数据包装进指定存档。
+///
+/// 和 [`install_file`] 的区别只有落点：数据包进的是
+/// `saves/<存档>/datapacks/`，不在实例根下。
+pub fn install_datapack(
+    game_dir: &Path,
+    instance: &str,
+    world: &str,
+    file: &ModFile,
+) -> Result<PathBuf, String> {
+    if world.trim().is_empty() {
+        return Err("还没有挑存档，数据包不知道往哪儿放".to_string());
+    }
+    let dir = datapack_dir(game_dir, instance, world);
+    if !dir.is_dir() {
+        return Err(format!(
+            "{} 里没有这个存档（{}），先把游戏开一次让它生成",
+            instance, world
+        ));
+    }
+    let dest = dir.join(&file.filename);
+    crate::transport::download_to(&file.url, &dest, file.sha1.as_deref())
+        .map_err(|e| format!("下载 {} 失败: {}", file.filename, e))?;
+    Ok(dest)
 }
 
 #[cfg(test)]
@@ -840,9 +1024,174 @@ mod tests {
 
     #[test]
     fn every_kind_lands_in_its_own_folder() {
-        assert_eq!(ProjectKind::Mod.dir(), "mods");
-        assert_eq!(ProjectKind::ResourcePack.dir(), "resourcepacks");
-        assert_eq!(ProjectKind::Shader.dir(), "shaderpacks");
+        assert_eq!(ProjectKind::Mod.dir(), Some("mods"));
+        assert_eq!(ProjectKind::ResourcePack.dir(), Some("resourcepacks"));
+        assert_eq!(ProjectKind::Shader.dir(), Some("shaderpacks"));
+        // 整合包不往现有实例里塞东西，它自己长成一个实例
+        assert_eq!(ProjectKind::Modpack.dir(), None);
+        assert!(!ProjectKind::Modpack.installs_into_instance());
+        assert!(ProjectKind::Mod.installs_into_instance());
+        // 数据包不进实例根：它只对某一个存档生效，落点得带上存档名
+        assert_eq!(ProjectKind::Datapack.dir(), None);
+        assert!(ProjectKind::Datapack.installs_into_instance());
+        assert!(ProjectKind::Datapack.installs_into_world());
+        assert!(!ProjectKind::Mod.installs_into_world());
+        assert!(!ProjectKind::Modpack.installs_into_world());
+    }
+
+    #[test]
+    fn datapack_categories_are_playability_oriented() {
+        // 分辨率、加载器那类分类对数据包完全没意义
+        assert!(!ProjectKind::Datapack
+            .categories()
+            .iter()
+            .any(|(id, _)| *id == "16x" || *id == "fabric"));
+        assert!(ProjectKind::Datapack
+            .categories()
+            .iter()
+            .any(|(id, _)| *id == "worldgen"));
+        assert_eq!(category_label("worldgen"), Some("世界生成"));
+    }
+
+    fn sample_file() -> ModFile {
+        ModFile {
+            version_number: "1.0".to_string(),
+            url: "http://127.0.0.1:1/never.zip".to_string(),
+            filename: "terralith.zip".to_string(),
+            sha1: None,
+        }
+    }
+
+    #[test]
+    fn a_datapack_without_a_world_is_refused_before_touching_the_disk() {
+        let temp = crate::testutil::fresh_dir("modrinth-noworld");
+        let err = install_datapack(&temp, "1.20.1", "  ", &sample_file())
+            .expect_err("没挑存档就该拦下");
+        assert!(err.contains("存档"), "{}", err);
+    }
+
+    #[test]
+    fn datapacks_land_inside_the_chosen_world() {
+        let temp = crate::testutil::fresh_dir("modrinth-world");
+        // 存档目录不在时必须明说，而不是自己新建一个空存档
+        let err = install_datapack(&temp, "1.20.1", "world", &sample_file())
+            .expect_err("存档不存在就该拒绝");
+        assert!(err.contains("没有这个存档"), "{}", err);
+        assert!(
+            !datapack_dir(&temp, "1.20.1", "world").exists(),
+            "不该顺手把存档目录造出来"
+        );
+
+        let dir = datapack_dir(&temp, "1.20.1", "world");
+        assert!(dir.ends_with("world/datapacks"), "{}", dir.display());
+    }
+
+    #[test]
+    fn worlds_are_listed_straight_from_the_saves_folder() {
+        let temp = crate::testutil::fresh_dir("modrinth-saves");
+        assert!(list_worlds(&temp, "1.20.1").is_empty(), "还没有存档");
+        let saves = content_dir(&temp, "1.20.1", "saves");
+        std::fs::create_dir_all(saves.join("New World")).expect("建存档");
+        let worlds = list_worlds(&temp, "1.20.1");
+        assert_eq!(worlds, vec!["New World".to_string()]);
+    }
+
+    #[test]
+    fn modpacks_take_mrpack_only() {
+        assert!(ProjectKind::Modpack.accepts("Fabulously Optimized 5.9.0.mrpack"));
+        assert!(!ProjectKind::Modpack.accepts("Faithful 32x.zip"));
+        assert!(!ProjectKind::Modpack.accepts("sodium.jar"));
+        // 反过来：.mrpack 不该被当成资源包或光影包
+        assert!(!ProjectKind::ResourcePack.accepts("pack.mrpack"));
+        assert!(!ProjectKind::Shader.accepts("pack.mrpack"));
+        assert!(!ProjectKind::Mod.accepts("pack.mrpack"));
+    }
+
+    #[test]
+    fn the_modpack_tab_has_its_own_categories() {
+        assert_eq!(ProjectKind::Modpack.categories()[0], ("", "全部分类"));
+        assert!(ProjectKind::Modpack
+            .categories()
+            .iter()
+            .any(|(id, _)| *id == "kitchen-sink"));
+        // 「大杂烩」只在整合包上有意义
+        assert!(!ProjectKind::Mod
+            .categories()
+            .iter()
+            .any(|(id, _)| *id == "kitchen-sink"));
+        // 查分类名要能翻到第四张表
+        assert_eq!(category_label("kitchen-sink"), Some("大杂烩"));
+    }
+
+    #[test]
+    fn a_pack_lands_in_the_staging_folder() {
+        let root = crate::testutil::fresh_dir("packstage");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).expect("建源目录");
+        // 文件名不带空格：file:// 地址里的空格 curl 会当成畸形 URL 拒掉，
+        // 真实的 Modrinth 地址是 %20 编码过的，不受这个影响。
+        let archive = src.join("Fabulously-Optimized.mrpack");
+        std::fs::write(&archive, b"not really a zip").expect("写源文件");
+        // curl 认 file://，这里不必真去网上拉一个几百兆的包
+        let url = format!(
+            "file:///{}",
+            archive.display().to_string().replace('\\', "/")
+        );
+        let file = ModFile {
+            version_number: "1.0".to_string(),
+            url,
+            filename: "Fabulously-Optimized.mrpack".to_string(),
+            sha1: None,
+        };
+        let staging = root.join("downloads");
+        let dest = download_pack(&staging, &file).expect("该能下到暂存目录");
+        assert!(dest.is_file(), "{}", dest.display());
+        assert_eq!(
+            dest.parent(),
+            Some(staging.join("整合包").as_path()),
+            "整合包要单独放一个子目录，别和别的东西混在一起"
+        );
+        assert_eq!(
+            dest.file_name().and_then(|n| n.to_str()),
+            Some("Fabulously-Optimized.mrpack")
+        );
+    }
+
+    #[test]
+    fn a_pack_leaves_nothing_behind_once_it_is_installed() {
+        let root = crate::testutil::fresh_dir("packdiscard");
+        let dir = root.join("downloads").join("整合包");
+        std::fs::create_dir_all(&dir).expect("建暂存目录");
+        let dest = dir.join("Fabulously-Optimized.mrpack");
+        std::fs::write(&dest, b"zip").expect("写包");
+        discard_pack(&dest);
+        assert!(!dest.exists(), "装完之后包不该还占着地方");
+        assert!(!dir.exists(), "整个目录空了，连目录一起收掉");
+    }
+
+    #[test]
+    fn discarding_a_pack_that_is_already_gone_is_quiet() {
+        let root = crate::testutil::fresh_dir("packdiscard2");
+        // 文件本来就不在、父目录也不在，都不该 panic：收尾失败不是错。
+        discard_pack(&root.join("downloads").join("整合包").join("gone.mrpack"));
+    }
+
+    #[test]
+    fn installing_a_pack_into_an_instance_is_refused() {
+        let file = ModFile {
+            version_number: "1.0".to_string(),
+            url: "https://example.invalid/pack.mrpack".to_string(),
+            filename: "pack.mrpack".to_string(),
+            sha1: None,
+        };
+        let err = install_file(
+            Path::new("E:/nowhere"),
+            "1.20.1-Fabric",
+            ProjectKind::Modpack,
+            &file,
+        )
+        .expect_err("整合包不该被塞进实例");
+        assert!(err.contains("整合包"), "{}", err);
     }
 
     #[test]
@@ -943,6 +1292,7 @@ mod tests {
     // 用 r##"…"##：正文里 `"# Sodium` 那串会把 r#"…"# 提前收尾。
     const DETAIL: &str = r##"{
         "id": "AANobbMI",
+        "slug": "sodium",
         "title": "Sodium",
         "description": "现代渲染引擎",
         "body": "# Sodium
@@ -965,6 +1315,7 @@ mod tests {
     fn detail_reads_what_the_page_shows() {
         let d = parse_detail(DETAIL).expect("样例应该能解析");
         assert_eq!(d.id, "AANobbMI");
+        assert_eq!(d.slug, "sodium");
         assert_eq!(d.author, "CaffeineMC");
         assert_eq!(d.follows, 1234);
         assert_eq!(d.follows_text(), "1234");

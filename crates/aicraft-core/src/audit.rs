@@ -38,6 +38,14 @@ pub fn detail(what: impl AsRef<str>) {
 /// （这是刻意的，见 `settings::page` 的注释），没有统一的“提交”时刻。
 /// 每帧拿一份快照对比，是唯一能覆盖到所有字段、又不会漏掉新加字段的办法
 /// ——只要新字段在这里补一行。
+/// 把 0..=255 的不透明度折成百分比文字。
+///
+/// 界面上的滑杆也是按百分比显示的，日志跟着用同一套说法，
+/// 玩家对照着看不会对不上。
+fn alpha_percent(alpha: u8) -> String {
+    format!("{}%", (alpha as u32) * 100 / 255)
+}
+
 pub fn settings_changes(before: &Settings, after: &Settings) -> Vec<String> {
     let mut changes = Vec::new();
     if before.mirror != after.mirror {
@@ -115,6 +123,21 @@ pub fn settings_changes(before: &Settings, after: &Settings) -> Vec<String> {
             path_text(after.java_path.as_deref())
         ));
     }
+    // 手动添加的 Java 可能有增删，同样按条目差集写。
+    for path in after
+        .java_paths
+        .iter()
+        .filter(|path| !before.java_paths.contains(path))
+    {
+        changes.push(format!("Java 列表：加入 {}", path.trim()));
+    }
+    for path in before
+        .java_paths
+        .iter()
+        .filter(|path| !after.java_paths.contains(path))
+    {
+        changes.push(format!("Java 列表：移除 {}", path.trim()));
+    }
     if before.game_dir != after.game_dir {
         changes.push(format!(
             "游戏目录：{} → {}",
@@ -143,6 +166,19 @@ pub fn settings_changes(before: &Settings, after: &Settings) -> Vec<String> {
             after.launcher_mode.label()
         ));
     }
+    if before.window_mode != after.window_mode {
+        changes.push(format!(
+            "窗口大小：{} → {}",
+            before.window_mode.label(),
+            after.window_mode.label()
+        ));
+    }
+    if before.window_width != after.window_width || before.window_height != after.window_height {
+        changes.push(format!(
+            "窗口分辨率：{}×{} → {}×{}",
+            before.window_width, before.window_height, after.window_width, after.window_height
+        ));
+    }
     if before.offline_name != after.offline_name {
         changes.push(format!(
             "离线用户名：{} → {}",
@@ -164,11 +200,61 @@ pub fn settings_changes(before: &Settings, after: &Settings) -> Vec<String> {
     {
         changes.push(format!("服务端目录：移除 {}", dir));
     }
-    if before.nav_collapsed != after.nav_collapsed {
+    for dir in after
+        .hidden_server_dirs
+        .iter()
+        .filter(|dir| !before.hidden_server_dirs.contains(dir))
+    {
+        changes.push(format!("服务端目录：从列表移除 {}", dir));
+    }
+    for dir in before
+        .hidden_server_dirs
+        .iter()
+        .filter(|dir| !after.hidden_server_dirs.contains(dir))
+    {
+        changes.push(format!("服务端目录：重新显示 {}", dir));
+    }
+    if before.animate_ui != after.animate_ui {
         changes.push(format!(
-            "导航收起：{} → {}",
-            on_off(before.nav_collapsed),
-            on_off(after.nav_collapsed)
+            "页面过渡动画：{} → {}",
+            on_off(before.animate_ui),
+            on_off(after.animate_ui)
+        ));
+    }
+    if before.high_performance_gpu != after.high_performance_gpu {
+        changes.push(format!(
+            "高性能显卡：{} → {}",
+            on_off(before.high_performance_gpu),
+            on_off(after.high_performance_gpu)
+        ));
+    }
+    if before.background_image != after.background_image {
+        changes.push(format!(
+            "背景图：{} → {}",
+            quoted(&before.background_image),
+            quoted(&after.background_image)
+        ));
+    }
+    // 三块底色分开记账：一次只动一根滑杆时，日志里看得出动的是哪一块。
+    for (name, before_alpha, after_alpha) in [
+        ("顶栏与侧边栏", before.ui_alphas.chrome, after.ui_alphas.chrome),
+        ("右侧背景", before.ui_alphas.background, after.ui_alphas.background),
+        ("卡片", before.ui_alphas.card, after.ui_alphas.card),
+    ] {
+        if before_alpha != after_alpha {
+            changes.push(format!(
+                "面板不透明度（{}）：{} → {}",
+                name,
+                alpha_percent(before_alpha),
+                alpha_percent(after_alpha)
+            ));
+        }
+    }
+    if before.theme_color != after.theme_color {
+        changes.push(format!(
+            "界面主题色：{} → {}",
+            before.theme_color.label(),
+            after.theme_color.label()
         ));
     }
     // 目录列表可能有增删，按条目差集写，不然只能看出「变了」看不出「加了哪个」
@@ -333,12 +419,17 @@ mod tests {
         all.hide_official_dir = true;
         all.isolate_instances = false;
         all.launcher_mode = crate::settings::LauncherMode::Close;
+        all.window_mode = crate::settings::WindowMode::Fixed;
+        all.window_width = 1920;
+        all.window_height = 1080;
         all.offline_name = "Steve".to_string();
         all.server_dirs = vec!["D:\\srv".to_string()];
-        all.nav_collapsed = true;
+        all.hidden_server_dirs = vec!["D:\\gone".to_string()];
+        all.animate_ui = false;
+        all.theme_color = crate::settings::ThemeColor::Cyan;
 
         let changes = settings_changes(&base, &all);
-        // 16 个普通字段 + 游戏目录 1 条 + 服务端目录 1 条
-        assert_eq!(changes.len(), 19, "有字段没被记录：{:?}", changes);
+        // 20 个普通字段 + 游戏目录 1 条 + 服务端目录 1 条 + 隐藏目录 1 条
+        assert_eq!(changes.len(), 23, "有字段没被记录：{:?}", changes);
     }
 }

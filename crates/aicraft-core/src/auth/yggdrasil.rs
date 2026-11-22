@@ -118,10 +118,7 @@ pub fn normalize_api_root(input: &str) -> Result<String, String> {
 /// 区分「同一个客户端的多次登录」。这里不用 UUID：随机 16 字节转十六进制
 /// 就够，且不必为格式化再引一个依赖。
 fn client_token() -> String {
-    super::random_bytes(16)
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect()
+    crate::hex::to_hex(&super::random_bytes(16))
 }
 
 /// 认证接口的完整地址。

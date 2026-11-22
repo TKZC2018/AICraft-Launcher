@@ -17,6 +17,7 @@
 
 # ── 图标生成的预览图（只给人看，不参与构建）──────────────
 /tools/logo-preview/
+/tools/__pycache__/
 
 # ── 编辑器 / 系统杂项 ─────────────────────────────────────
 .idea/
@@ -24,3 +25,5 @@
 *.swp
 .DS_Store
 Thumbs.db
+/.client-id
+nohup.out

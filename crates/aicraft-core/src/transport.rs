@@ -579,12 +579,29 @@ pub fn post_raw(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<HttpResponse, FetchError> {
+    send("POST", url, content_type, headers, Some(body))
+}
+
+/// 发送任意 HTTP 方法的请求，返回状态码 + 正文。
+///
+/// 换皮肤/披风要用 `PUT` 与 `DELETE`，它们和 `POST` 只差一个方法名，
+/// 而重试、状态码切分、正文喂 stdin 这些细节完全一样 —— 所以只留这一个入口。
+///
+/// 只有可重试的网络抖动会重试；`PUT` 在这里也是幂等的（设置成同一张皮肤
+/// 再来一遍没有副作用），所以和 `POST` 一起走同一套退避。
+pub fn send(
+    method: &str,
+    url: &str,
+    content_type: Option<&str>,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+) -> Result<HttpResponse, FetchError> {
     let mut last_err = None;
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(300 * attempt as u64));
         }
-        match run_http("POST", url, content_type, headers, Some(body)) {
+        match run_http(method, url, content_type, headers, body) {
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 if !e.is_retryable() {
@@ -595,9 +612,32 @@ pub fn post_raw(
         }
     }
     Err(last_err.unwrap_or_else(|| FetchError {
-        message: format!("POST {} 失败", url),
+        message: format!("{} {} 失败", method, url),
         exit_code: None,
     }))
+}
+
+/// 只试一次的 POST，超时由调用方定。
+///
+/// 给「先试镜像、超时就换源」这种场景用：默认的 [`send`] 会重试三次、
+/// 每次等 60 秒，镜像那边卡住时光是等它就够久了。
+pub fn post_within(
+    url: &str,
+    content_type: Option<&str>,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    timeout_secs: u32,
+) -> Result<HttpResponse, FetchError> {
+    run_http_with_timeout("POST", url, content_type, headers, Some(body), timeout_secs)
+}
+
+/// 只试一次的 GET，超时由调用方定。见 [`post_within`]。
+pub fn get_within(
+    url: &str,
+    headers: &[(&str, &str)],
+    timeout_secs: u32,
+) -> Result<HttpResponse, FetchError> {
+    run_http_with_timeout("GET", url, None, headers, None, timeout_secs)
 }
 
 /// 以 `application/x-www-form-urlencoded` 发送表单。
@@ -635,6 +675,18 @@ fn run_http(
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> Result<HttpResponse, FetchError> {
+    run_http_with_timeout(method, url, content_type, headers, body, 60)
+}
+
+/// [`run_http`] 的本体：多一个超时参数。
+fn run_http_with_timeout(
+    method: &str,
+    url: &str,
+    content_type: Option<&str>,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+    timeout_secs: u32,
+) -> Result<HttpResponse, FetchError> {
     let mut cmd = crate::spawn::silent(curl_path());
     cmd.args([
         "--silent",
@@ -642,7 +694,7 @@ fn run_http(
         // 跟随重定向：微软的登录端点会把 /authorize 转给租户专用域名
         "--location",
         "--max-time",
-        "60",
+        &timeout_secs.to_string(),
         "--request",
         method,
         // 状态码贴在正文后面，便于区分「正文」与「结果」

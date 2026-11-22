@@ -1180,18 +1180,35 @@ fn cmd_launch(args: &[String]) -> i32 {
     }
 }
 
-/// 客户端 ID：写死在 [`aicraft_core::auth::DEFAULT_CLIENT_ID`] 里，不可改。
+/// 取这次构建带的客户端 ID；没带就打印说明并给空串。
+///
+/// 空串再往下走只会换来一个含糊的 400，所以在调用点先拦住。
 fn configured_client_id() -> String {
-    aicraft_core::auth::DEFAULT_CLIENT_ID.to_string()
+    match aicraft_core::auth::client_id() {
+        Ok(id) => id.to_string(),
+        Err(e) => {
+            eprintln!("{}", e);
+            print_auth_error(&e);
+            String::new()
+        }
+    }
 }
 
 /// 正版登录：默认设备码（终端里最省事），`--browser` 走浏览器回调。
 ///
-/// 客户端 ID 写死在代码里，不需要也不允许改。
+/// 客户端 ID 由编译期注入（`build.rs`），源码里不带。
 fn cmd_login(args: &[String]) -> i32 {
     use aicraft_core::auth::{self, msa, store};
 
-    let client_id: &str = aicraft_core::auth::DEFAULT_CLIENT_ID;
+    let client_id = aicraft_core::auth::client_id();
+    let client_id: &str = match client_id {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("{}", e);
+            print_auth_error(&e);
+            return 1;
+        }
+    };
     let mut browser = false;
     let mut store_path = store::default_path();
 
@@ -1362,6 +1379,10 @@ fn print_auth_error(error: &aicraft_core::auth::AuthError) {
             eprintln!("微软账号、Xbox Live、XSTS 都已经通过了，卡在 Minecraft 服务这一跳。");
             eprintln!("这是 Mojang 对第三方启动器的白名单：新注册的 Azure 应用会被拒绝，");
             eprintln!("只能等审批（https://aka.ms/AppRegInfo）。审批通过前请用离线模式。");
+        }
+        AuthErrorKind::MissingClientId => {
+            eprintln!("这一份构建没有带 Azure 应用 ID，正版登录用不了。");
+            eprintln!("编译时设 AICRAFT_CLIENT_ID，或在仓库根放一个 .client-id 文件。");
         }
         AuthErrorKind::Network => {
             eprintln!("检查网络；这个启动器走系统 curl，代理设置也要跟着设。");

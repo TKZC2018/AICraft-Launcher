@@ -14,6 +14,7 @@
 //! 也没法在 `unsafe_code = "forbid"` 下调 Win32。这一点在文档里说清楚，
 //! 比写一句「已加密」更诚实。
 
+use crate::hex::to_hex;
 use crate::sha256;
 
 /// 种子文件名（放在数据目录里，和 `accounts.json` 同一个文件夹）。
@@ -182,16 +183,6 @@ fn xor_keystream(data: &[u8], key: &[u8; 32]) -> Vec<u8> {
     }
     for (index, slot) in out.iter_mut().enumerate() {
         *slot ^= data[index];
-    }
-    out
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0F) as usize] as char);
     }
     out
 }

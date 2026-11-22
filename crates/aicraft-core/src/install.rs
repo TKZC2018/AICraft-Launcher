@@ -28,7 +28,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::json::{self, Json};
-use crate::rules::{RuleContext, is_allowed};
+use crate::rules::{RuleContext, expand_arch_placeholder, is_allowed};
 use crate::settings::Mirror;
 use crate::cancel::CancelToken;
 use crate::speed::Budget;
@@ -734,19 +734,6 @@ fn instance_official_id_of(text: &str, instance: &str) -> String {
 /// 老版本清单（1.8 时代）把 native 分类符写成
 /// `natives-windows-${arch}`，需要替换成 `64` 或 `32` ——
 /// 注意这里用的是 **位数**，不是 `x86_64`/`arm64` 这种架构名。
-fn expand_arch_placeholder(classifier: &str, ctx: &RuleContext) -> String {
-    if !classifier.contains("${arch}") {
-        return classifier.to_string();
-    }
-    let bits = match ctx.os.arch {
-        crate::rules::Arch::X86 => "32",
-        // 64 位 ARM 在 Minecraft 老版本里没有对应 native，
-        // 按 64 位 Intel 处理是唯一可行的兜底。
-        _ => "64",
-    };
-    classifier.replace("${arch}", bits)
-}
-
 /// 下载版本清单。
 pub fn fetch_manifest() -> Result<VersionManifest, String> {
     fetch_manifest_in(None)

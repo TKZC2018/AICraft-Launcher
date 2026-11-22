@@ -120,6 +120,10 @@ pub fn page(
     extra: &[String],
     show_official: bool,
     busy: bool,
+    // 标题行从右侧滑进来的进度（0 = 最右，1 = 到位）；None = 不播。
+    slide: Option<f32>,
+    // 各行进场已经播了多久；None = 不播（动画关着或已经播完）。
+    elapsed: Option<f32>,
 ) -> Option<Action> {
     let mut action = None;
 
@@ -138,56 +142,66 @@ pub fn page(
     let others = &layout.others;
     let row_count = layout.row_count;
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("目录列表").size(17.0).strong());
-        ui.add_space(4.0);
-        if theme::refresh_button(ui, !busy)
-            .on_hover_text("点击刷新列表")
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
-            action = Some(Action::Rescan);
-        }
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(format!("{} 个目录", row_count))
-                .size(11.0)
-                .color(theme::TEXT_WEAK),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add_enabled(!busy, egui::Button::new("添加目录…"))
+    theme::title_slide(ui, slide, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("目录列表").size(17.0).strong());
+            ui.add_space(4.0);
+            if theme::refresh_button(ui, !busy)
+                .on_hover_text("点击刷新列表")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
             {
-                action = Some(Action::Add);
+                action = Some(Action::Rescan);
             }
-            // 官方目录被移掉之后，这里给一条把它找回来的路——没有这个，
-            // 「移除」就成了单向操作，只能去改配置文件。
-            if !show_official {
-                ui.add_space(6.0);
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("{} 个目录", row_count))
+                    .size(11.0)
+                    .color(theme::TEXT_WEAK),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(!busy, egui::Button::new("恢复官方目录"))
+                    .add_enabled(!busy, egui::Button::new("添加目录…"))
                     .clicked()
                 {
-                    action = Some(Action::ShowOfficial);
+                    action = Some(Action::Add);
                 }
-            }
+                // 官方目录被移掉之后，这里给一条把它找回来的路——没有这个，
+                // 「移除」就成了单向操作，只能去改配置文件。
+                if !show_official {
+                    ui.add_space(6.0);
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("恢复官方目录"))
+                        .clicked()
+                    {
+                        action = Some(Action::ShowOfficial);
+                    }
+                }
+            });
         });
     });
     ui.add_space(10.0);
 
     // 官方目录：默认就有一行，也可以移掉——它只是一个默认项，不是长住的。
     // 即使没装过官方启动器也画出来，标一句「不存在」，免得用户以为启动器把它吞了。
+    // 逐行进场的序号：官方目录、当前目录、用户自己加的，按画出来的顺序数。
+    // 三块的来源不同（块由页面拼、序号由页面数），所以用一个游标往下推，
+    // 免得每一块各从 0 开始、几行同时冒出来。
+    let mut index = 0usize;
     if layout.show_official {
-        match row(
-            ui,
-            "官方目录",
-            &layout.official_text,
-            layout.official_exists,
-            layout.official_is_current,
-            true,
-            busy,
-        ) {
+        let result = theme::reveal_row(ui, index, elapsed, |ui| {
+            row(
+                ui,
+                "官方目录",
+                &layout.official_text,
+                layout.official_exists,
+                layout.official_is_current,
+                true,
+                busy,
+            )
+        });
+        index += 1;
+        match result {
             RowAction::Switch => action = Some(Action::Switch(layout.official_text.clone())),
             // 官方那一行的「移除」翻译成「隐藏」：只动显示，
             // 跟用户自己加的目录从 game_dirs 里真删一条不是一回事。
@@ -201,35 +215,28 @@ pub fn page(
     // 或者官方那行被移掉而当前用的正是官方目录）。
     if layout.orphan_current {
         let current_ok = !current.trim().is_empty() && Path::new(current).is_dir();
-        row(ui, "当前目录", current, current_ok, true, false, busy);
+        theme::reveal_row(ui, index, elapsed, |ui| {
+            row(ui, "当前目录", current, current_ok, true, false, busy);
+        });
+        index += 1;
         ui.add_space(6.0);
     }
 
     // 用户自己加的，一个都不藏。其中可能有「正好是当前目录」的那一项——
     // 它照样显示，只是行尾不画「设为当前」、改画「当前」标签。
     if others.is_empty() {
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let (title, hint) = if show_official {
-                (
-                    "还没有添加过别的目录",
-                    "点右上角「添加目录…」把另一个 .minecraft 加进来；这里只记路径，不动里面的文件。",
-                )
-            } else {
-                (
-                    "列表是空的",
-                    "点右上角「添加目录…」加一个，或者用「恢复官方目录」把默认的那个找回来。",
-                )
-            };
-            ui.label(RichText::new(title).size(12.5).color(theme::TEXT_WEAK));
-            ui.add_space(3.0);
-            ui.label(RichText::new(hint).size(11.0).color(theme::TEXT_WEAK));
-        });
+        // 空状态那张卡片也是列表的一部分：前面的行还在淡入时，
+        // 底下这张一下全亮着会很跳，所以它跟着同一批节奏进场。
+        theme::reveal_row(ui, index, elapsed, |ui| empty_card(ui, show_official));
     } else {
         for dir in others.iter().copied() {
             let exists = Path::new(dir).is_dir();
             let is_current = same_path(Path::new(dir), current);
-            match row(ui, "其他目录", dir, exists, is_current, true, busy) {
+            let result = theme::reveal_row(ui, index, elapsed, |ui| {
+                row(ui, "其他目录", dir, exists, is_current, true, busy)
+            });
+            index += 1;
+            match result {
                 RowAction::Switch => action = Some(Action::Switch(dir.clone())),
                 RowAction::Remove => action = Some(Action::Remove(dir.clone())),
                 RowAction::None => {}
@@ -239,6 +246,27 @@ pub fn page(
     }
 
     action
+}
+
+/// 列表为空时的那张说明卡。
+fn empty_card(ui: &mut egui::Ui, show_official: bool) {
+    theme::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let (title, hint) = if show_official {
+            (
+                "还没有添加过别的目录",
+                "点右上角「添加目录…」把另一个 .minecraft 加进来；这里只记路径，不动里面的文件。",
+            )
+        } else {
+            (
+                "列表是空的",
+                "点右上角「添加目录…」加一个，或者用「恢复官方目录」把默认的那个找回来。",
+            )
+        };
+        ui.label(RichText::new(title).size(12.5).color(theme::TEXT_WEAK));
+        ui.add_space(3.0);
+        ui.label(RichText::new(hint).size(11.0).color(theme::TEXT_WEAK));
+    });
 }
 
 /// 画一行目录。

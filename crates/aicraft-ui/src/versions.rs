@@ -81,6 +81,10 @@ pub struct State {
     pub fetching: bool,
     /// 正在安装的版本名字（实例名）
     pub installing: Option<String>,
+    /// 这一批清单开始「逐行进场」的时刻；播完置回 None。
+    ///
+    /// 放在 State 里而不是 App：进场跟着「这一批行」走，清单换了才重播。
+    pub reveal_at: Option<std::time::Instant>,
 }
 
 impl Default for State {
@@ -93,6 +97,7 @@ impl Default for State {
             loaded: false,
             fetching: false,
             installing: None,
+            reveal_at: None,
         }
     }
 }
@@ -113,6 +118,8 @@ impl State {
         self.entries = entries;
         self.loaded = true;
         self.fetching = false;
+        // 换了一批行，进场重播一次。
+        self.reveal_at = Some(std::time::Instant::now());
     }
 
     /// 拉取失败。
@@ -160,102 +167,121 @@ impl Action {
 ///
 /// 和清单分开画，是因为选加载器那一步要把清单那一整块换掉：标题和筛选
 /// 仍然该留着，玩家得能看见自己挑的是哪个版本。
-pub fn header(ui: &mut egui::Ui, state: &mut State, busy: Option<&str>) -> Option<Action> {
+pub fn header(
+    ui: &mut egui::Ui,
+    state: &mut State,
+    busy: Option<&str>,
+    // 页头动画已经跑了多久（秒）；None = 早就播完，或者动画关着。
+    //
+    // 标题与工具栏各有各的起步点，所以这里收的是时间而不是进度：
+    // 两段各自折成 0 到 1，才排得出「先标题、再工具栏」的先后。
+    head: Option<f32>,
+) -> Option<Action> {
     let mut action = None;
 
-    // ---- 标题行 ----
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("下载版本").size(17.0).strong());
-        ui.add_space(4.0);
-        if theme::refresh_button(ui, busy.is_none() && !state.fetching)
-            .on_hover_text("点击刷新列表")
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
-            action = Some(Action::Refresh);
-        }
-        ui.add_space(6.0);
-        if state.fetching {
-            ui.spinner();
-            ui.label(
-                RichText::new("正在获取官方版本清单…")
-                    .size(11.0)
-                    .color(theme::TEXT_WEAK),
-            );
-        } else if let Some(name) = &state.installing {
-            ui.spinner();
-            ui.label(
-                RichText::new(format!("正在安装 {}", name))
-                    .size(11.0)
-                    .color(theme::ACCENT_STRONG),
-            );
-        } else if state.loaded {
-            ui.label(
-                RichText::new(format!("官方清单共 {} 个版本", state.entries.len()))
-                    .size(11.0)
-                    .color(theme::TEXT_WEAK),
-            );
-        } else {
-            ui.label(
-                RichText::new("还没有获取清单")
-                    .size(11.0)
-                    .color(theme::TEXT_WEAK),
-            );
-        }
-
-        // 导入整合包放在标题行右侧：它和「下载版本」是同一件事的两种来源
-        // （一个是官方清单，一个是别人打包好的），放同一行读着顺。
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let enabled = busy.is_none();
-            if ui
-                .add_enabled(
-                    enabled,
-                    egui::Button::new(RichText::new("导入整合包").size(12.0).color(if enabled {
-                        theme::TEXT
-                    } else {
-                        theme::TEXT_FAINT
-                    }))
-                    .fill(theme::CARD)
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .min_size(egui::vec2(88.0, 26.0)),
-                )
-                .on_hover_text("从磁盘挑一个 .mrpack 或 .zip；也可以直接把文件拖进窗口")
+    let title = theme::slide_progress(head, 0.0, theme::TITLE_SLIDE_SECS);
+    theme::title_slide(ui, title, |ui| {
+        // ---- 标题行 ----
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("下载版本").size(17.0).strong());
+            ui.add_space(4.0);
+            if theme::refresh_button(ui, busy.is_none() && !state.fetching)
+                .on_hover_text("点击刷新列表")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
             {
-                action = Some(Action::ImportPack);
+                action = Some(Action::Refresh);
             }
+            ui.add_space(6.0);
+            if state.fetching {
+                ui.spinner();
+                ui.label(
+                    RichText::new("正在获取官方版本清单…")
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            } else if let Some(name) = &state.installing {
+                ui.spinner();
+                ui.label(
+                    RichText::new(format!("正在安装 {}", name))
+                        .size(11.0)
+                        .color(theme::accent_strong()),
+                );
+            } else if state.loaded {
+                ui.label(
+                    RichText::new(format!("官方清单共 {} 个版本", state.entries.len()))
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            } else {
+                ui.label(
+                    RichText::new("还没有获取清单")
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            }
+
+            // 导入整合包放在标题行右侧：它和「下载版本」是同一件事的两种来源
+            // （一个是官方清单，一个是别人打包好的），放同一行读着顺。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let enabled = busy.is_none();
+                if ui
+                    .add_enabled(
+                        enabled,
+                        egui::Button::new(RichText::new("导入整合包").size(12.0).color(if enabled {
+                            theme::TEXT
+                        } else {
+                            theme::TEXT_FAINT
+                        }))
+                        .fill(theme::CARD)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .min_size(egui::vec2(88.0, 26.0)),
+                    )
+                    .on_hover_text("从磁盘挑一个 .mrpack 或 .zip；也可以直接把文件拖进窗口")
+                    .clicked()
+                {
+                    action = Some(Action::ImportPack);
+                }
+            });
         });
     });
     ui.add_space(10.0);
 
     // ---- 工具栏：搜索 + 类型筛选 ----
-    ui.horizontal(|ui| {
-        // 从右往左排：先排四个筛选按钮，搜索框最后吃掉剩下的宽度。
-        //
-        // 为什么不用「available_width() - 固定值」：按钮要占多宽取决于字号、
-        // 按钮内边距和 DPI，写死的保留值一旦估少了，最后一个按钮就会被挤出
-        // 卡片右边缘（125% 缩放时「全部」正好压到边框上）。让 egui 自己排，
-        // 它知道每个按钮的真实尺寸。
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // 让最右边那个按钮和下面卡片里的「下载」右边缘对齐：
-            // 卡片自己有一圈 16px 内边距，工具栏不在卡片里，得自己让出来。
-            ui.add_space(16.0);
-            let mut clicked = None;
-            for filter in [Filter::All, Filter::Old, Filter::Snapshot, Filter::Release] {
-                let selected = state.filter == filter;
-                if ui.selectable_label(selected, filter.label()).clicked() {
-                    clicked = Some(filter);
+    //
+    // 和标题同一个动作，但晚半拍起步：两条一起动像整块页头在平移，
+    // 错开一点才读得出「先标题、再工具栏」的先后。
+    let toolbar = theme::slide_progress(head, theme::TOOLBAR_SLIDE_DELAY, theme::TITLE_SLIDE_SECS);
+    theme::title_slide(ui, toolbar, |ui| {
+        ui.horizontal(|ui| {
+            // 从右往左排：先排四个筛选按钮，搜索框最后吃掉剩下的宽度。
+            //
+            // 为什么不用「available_width() - 固定值」：按钮要占多宽取决于字号、
+            // 按钮内边距和 DPI，写死的保留值一旦估少了，最后一个按钮就会被挤出
+            // 卡片右边缘（125% 缩放时「全部」正好压到边框上）。让 egui 自己排，
+            // 它知道每个按钮的真实尺寸。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 让最右边那个按钮和下面卡片里的「下载」右边缘对齐：
+                // 卡片自己有一圈 16px 内边距，工具栏不在卡片里，得自己让出来。
+                ui.add_space(16.0);
+                let mut clicked = None;
+                for filter in [Filter::All, Filter::Old, Filter::Snapshot, Filter::Release] {
+                    let selected = state.filter == filter;
+                    if ui.selectable_label(selected, filter.label()).clicked() {
+                        clicked = Some(filter);
+                    }
                 }
-            }
-            ui.add(
-                egui::TextEdit::singleline(&mut state.query)
-                    .hint_text("搜索版本号…")
-                    .desired_width(ui.available_width().max(120.0)),
-            );
-            if let Some(filter) = clicked {
-                state.filter = filter;
-            }
+                let mut resp = ui.add(
+                    egui::TextEdit::singleline(&mut state.query)
+                        .hint_text("搜索版本号…")
+                        .desired_width(ui.available_width().max(120.0)),
+                );
+                theme::input_menu(&mut resp, &mut state.query, false);
+                if let Some(filter) = clicked {
+                    state.filter = filter;
+                }
+            });
         });
     });
     ui.add_space(10.0);
@@ -266,7 +292,12 @@ pub fn header(ui: &mut egui::Ui, state: &mut State, busy: Option<&str>) -> Optio
 /// 版本清单本体：一列可滚动的版本卡片，底下跟一句说明。
 ///
 /// 选加载器时它会被整块顶掉——见 [`header`] 的说明。
-pub fn list(ui: &mut egui::Ui, state: &mut State, busy: Option<&str>) -> Option<Action> {
+pub fn list(
+    ui: &mut egui::Ui,
+    state: &mut State,
+    busy: Option<&str>,
+    animate: bool,
+) -> Option<Action> {
     let mut action = None;
     let visible = state.visible();
     if state.fetching && !state.loaded {
@@ -284,66 +315,80 @@ pub fn list(ui: &mut egui::Ui, state: &mut State, busy: Option<&str>) -> Option<
         return action;
     }
 
-    // 底部留一行说明的空间，其余全给列表。列表是这一页的正主；选加载器时
-    // 它被整块换掉，所以这里不用再为谁让位。
-    let list_height = (ui.available_height() - 34.0).max(160.0);
+    // 剩下的高度全给列表。原先这里还留着 34 像素给底下一行说明，那行说明
+    // 早就不画了，于是滚到底就空出白白一条；现在列表一直铺到页脚。
+    let list_height = ui.available_height().max(160.0);
 
-    egui::ScrollArea::vertical()
+    // 逐行进场的当前时刻；None 表示这一批早就进场完了，逐行走普通画法。
+    //
+    // 起步点排在页头之后（ROW_REVEAL_DELAY）：标题、工具栏、清单三段依次
+    // 出现，读起来才像「先看清这是哪一页，再看里面有什么」。
+    let reveal = theme::row_reveal_elapsed(
+        &mut state.reveal_at,
+        animate,
+        ui.ctx(),
+        theme::ROW_REVEAL_DELAY,
+    );
+
+    let out = egui::ScrollArea::vertical()
         .id_salt("download-page-list")
         .max_height(list_height)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for entry in &visible {
-                egui::Frame::NONE
-                    .fill(theme::CARD)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
-                    .corner_radius(8.0)
-                    .inner_margin(egui::Margin::symmetric(12, 7))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            // 左：版本号 + 类型 + 时间
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    // 每个版本前面一枚草方块：这一页列的全是原版，
-                                    // 用「草方块 + 版本号」比单放一串数字好认。
-                                    const ICON: f32 = 26.0;
-                                    let (icon_rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(ICON, ICON),
-                                        egui::Sense::hover(),
-                                    );
-                                    theme::loader_glyph(ui, icon_rect, None);
-                                    ui.add_space(4.0);
-                                    ui.label(RichText::new(&entry.id).size(13.5).strong());
-                                    theme::chip(ui, entry.type_label());
-                                });
-                                ui.label(
-                                    RichText::new(&entry.time)
-                                        .size(10.5)
-                                        .color(theme::TEXT_WEAK),
-                                );
-                            });
-
-                            // 右：就一个下载按钮。装没装过都长一样，
-                            // 这一页不认识「已安装」这个概念。
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add_enabled(busy.is_none(), egui::Button::new("下载"))
-                                        .clicked()
-                                    {
-                                        action = Some(Action::Install(entry.id.clone()));
-                                    }
-                                },
-                            );
-                        });
-                    });
+            for (index, entry) in visible.iter().enumerate() {
+                theme::reveal_row(ui, index, reveal, |ui| {
+                    row(ui, entry, busy, &mut action);
+                });
                 ui.add_space(4.0);
             }
         });
+    theme::fade_scrolled(ui, &out);
 
     action
+}
+
+/// 清单里的一行：左边版本号 + 类型 + 时间，右边一个「下载」按钮。
+fn row(ui: &mut egui::Ui, entry: &Entry, busy: Option<&str>, action: &mut Option<Action>) {
+    egui::Frame::NONE
+        .fill(theme::card_fill())
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(12, 7))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                // 左：版本号 + 类型 + 时间
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        // 每个版本前面一枚草方块：这一页列的全是原版，
+                        // 用「草方块 + 版本号」比单放一串数字好认。
+                        const ICON: f32 = 26.0;
+                        let (icon_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::hover());
+                        theme::loader_glyph(ui, icon_rect, None);
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&entry.id).size(13.5).strong());
+                        theme::chip(ui, entry.type_label());
+                    });
+                    ui.label(
+                        RichText::new(&entry.time)
+                            .size(10.5)
+                            .color(theme::TEXT_WEAK),
+                    );
+                });
+
+                // 右：就一个下载按钮。装没装过都长一样，
+                // 这一页不认识「已安装」这个概念。
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(busy.is_none(), egui::Button::new("下载"))
+                        .clicked()
+                    {
+                        *action = Some(Action::Install(entry.id.clone()));
+                    }
+                });
+            });
+        });
 }
 
 #[cfg(test)]

@@ -38,7 +38,7 @@ pub fn row(ui: &mut egui::Ui, text: &str, picked: bool, last: bool) -> bool {
     // 选中 / 悬停的底色上下各让出 3px：行与行之间有线，色块顶到线会显得糊。
     let boxed = rect.shrink2(egui::vec2(0.0, 3.0));
     let fill = if picked {
-        theme::ACCENT_SOFT
+        theme::accent_soft()
     } else if response.hovered() {
         theme::CARD_HOVER
     } else {
@@ -52,7 +52,7 @@ pub fn row(ui: &mut egui::Ui, text: &str, picked: bool, last: bool) -> bool {
         ui.painter().rect_stroke(
             boxed,
             egui::CornerRadius::same(7),
-            egui::Stroke::new(1.0, theme::ACCENT),
+            egui::Stroke::new(1.0, theme::accent_fill()),
             egui::StrokeKind::Inside,
         );
     }
@@ -64,11 +64,11 @@ pub fn row(ui: &mut egui::Ui, text: &str, picked: bool, last: bool) -> bool {
         ui.painter().hline(
             egui::Rangef::new(inner.left(), inner.right()),
             rect.bottom(),
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(0xE8, 0xED, 0xF4)),
+            egui::Stroke::new(1.0, theme::RULE),
         );
     }
     let color = if picked {
-        theme::ACCENT_STRONG
+        theme::accent_strong()
     } else {
         theme::TEXT
     };

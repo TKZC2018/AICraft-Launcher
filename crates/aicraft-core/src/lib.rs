@@ -18,7 +18,9 @@
 //! - [`launch`]   classpath 与启动参数拼装
 //! - [`natives`]  平台本地库解压（自带 ZIP / DEFLATE 实现）
 //! - [`java`]     Java 运行时探测与选择
+//! - [`javadl`]   Java 运行时的自动下载与安装（缺哪个版本就下哪个）
 //! - [`meminfo`]  本机物理内存（设置页的内存条与推荐值）
+//! - [`screen`]   屏幕工作区尺寸（「最大化窗口」要靠它算宽高）
 //! - [`modicon`]  从模组 jar 里取出作者放的图标（管理页的模组列表）
 //! - [`modupdate`] 按文件哈希认出模组并检查更新（管理页的「更新」）
 //! - [`codec`]    Base64URL / 百分号编码（正版登录的 PKCE 与表单）
@@ -27,16 +29,22 @@
 //! - [`logging`]  分级日志（环形缓冲 + 可选文件 sink）
 //! - [`audit`]    操作日志：玩家点了什么、改了什么（复盘用）
 //! - [`settings`] 启动器设置（版本下载源 / 并发 / 内存 / JVM / Java 路径）
+//! - [`gpu`]      让游戏跑在独显上（显卡首选项注册表）
 //! - [`spawn`]    不弹控制台地起子进程
+//! - [`clipboard`] 把文字放进系统剪贴板（走系统自带的 clip.exe）
 //! - [`speed`]    下载限速（总配额在并发流之间均分）
 //! - [`cancel`]   下载取消令牌（跨线程共享的开关）
 //! - [`server`]   服务端管理：装核心、写启动脚本、改 server.properties
+//! - [`mcdr`]     MCDReforged：探测 Python 环境、生成骨架、认出已有目录
+//! - [`instancecfg`] 单个实例自己的游戏设置（Java / 内存 / JVM 参数）
 //! - [`loader`]   模组加载器（Fabric / Forge / NeoForge）与 Fabric API 的安装
 //! - [`modrinth`] Modrinth 模组搜索与安装（资源下载页的数据来源）
 //! - [`modpack`]  整合包导入（Modrinth / HMCL / CurseForge 三种格式）
-//! - [`curseforge`] CurseForge 整合包里 projectID/fileID → 下载地址
+//! - [`curseforge`] CurseForge 整合包里 projectID/fileID → 下载地址（走无 key 的镜像）
+//! - [`packexport`] 导出整合包（HMCL / Modrinth 两种格式）
 //! - [`png`]      最小 PNG 解码（只为皮肤头像）
 //! - [`skin`]     皮肤头像：查档案、下皮肤、裁出那张脸
+//! - [`skinservice`] 换皮肤、换披风（Minecraft 服务上的三个写端点）
 //!
 //! 典型用法：
 //!
@@ -58,32 +66,45 @@ pub mod auth;
 pub mod cancel;
 pub mod codec;
 pub mod flatten;
+pub mod gpu;
+pub mod hex;
 pub mod install;
 pub mod instance;
+pub mod instancecfg;
 pub mod logging;
 pub mod java;
+pub mod javadl;
 pub mod json;
 pub mod launch;
 pub mod loader;
 pub mod maven;
+pub mod mcdr;
 pub mod meminfo;
 pub mod modicon;
+pub mod resourcepack;
 pub mod modupdate;
 pub mod curseforge;
+pub mod modnames;
 pub mod modpack;
 pub mod modrinth;
 pub mod natives;
+pub mod packicon;
+pub mod packexport;
 pub mod png;
+pub mod prune;
 pub mod repair;
 pub mod resolve;
 pub mod rules;
+pub mod screen;
 pub mod seal;
 pub mod server;
 pub mod sha1;
 pub mod settings;
 pub mod sha256;
 pub mod skin;
+pub mod skinservice;
 pub mod spawn;
+pub mod clipboard;
 pub mod speed;
 pub mod transport;
 pub mod verify;
@@ -124,7 +145,7 @@ pub use rules::{Features, OsInfo, RuleContext};
 pub use sha1::sha1_hex;
 pub use sha256::{sha256, sha256_hex};
 pub use codec::{base64url_nopad, percent_decode, urlencode};
-pub use settings::{LauncherMode, Mirror, Settings, official_game_dir};
+pub use settings::{LauncherMode, Mirror, Settings, WindowMode, official_game_dir};
 pub use verify::{Problem, VerifyMode, VerifyReport, verify_version};
 pub use version::{RawVersion, load_chain, load_chain_from_dir, parse_version};
 

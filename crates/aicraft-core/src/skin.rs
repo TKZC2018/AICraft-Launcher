@@ -103,12 +103,75 @@ pub fn skin_url_from_profile(text: &str) -> Result<String, String> {
     Ok(skin)
 }
 
-/// 原版默认皮肤里那张 8×8 的脸（classic，Steve）。
+/// 原版默认皮肤里那张 8×8 的脸。
 ///
-/// 取自客户端 jar 的 `assets/minecraft/textures/entity/player/wide/steve.png`：
-/// 区域 `(8, 8)` 起 8×8，每 4 个字节一个像素的 RGBA。帽子层 `(40, 8)` 那一片
-/// 在默认皮肤里是**全透明**的，所以这里不必存它 —— 少一份数据，也少一处会错的地方。
-const STEVE_FACE: &str = "\
+/// 直接从客户端 jar 的 `assets/minecraft/textures/entity/player/{slim,wide}/*.png`
+/// 的 `(8, 8)` 起 8×8 抄下来（每像素 RGBA 四字节）。帽子层 `(40, 8)` 那一片在
+/// 这些默认皮肤里是**全透明**的，所以不必存 —— 少一份数据，也少一处会错的地方。
+///
+/// 1.19.4 起原版有 18 张默认皮肤：9 个名字 × 宽/细两种模型。`slim/` 与 `wide/`
+/// 只有身体模型不同，脸是一样的，所以每个名字只存一份脸。
+const FACE_ALEX: &str = "\
+e58d3ffff3a858ffeb983ffff3a858ffe58d3fffeb983ffff3a858ffe58d3fff\
+eb983ffff3a858ffe58d3fffeb983fffe58d3fffe58d3fffeb983ffff3a858ff\
+eb983fffe58d3fffeb983fffe58d3fffdfc4a2ffdfc4a2ffe58d3fffeb983fff\
+eb983fffeb983fffe58d3fffebd0b0ffefdabfffebd0b0ffebd0b0ffe58d3fff\
+ebd0b0ffffffffff236224ffefdabfffefdabfff236224ffffffffffebd0b0ff\
+efdabfffefdabfffefdabfffefdabfffefdabfffefdabfffefdabfffefdabfff\
+efdabfffefdabfffefdabfffefbbb1ffefbbb1ffefdabfffefdabfffebd0b0ff\
+ebd0b0ffefdabfffefdabfffefdabfffefdabfffefdabfffebd0b0ffdfc4a2ff";
+
+const FACE_ARI: &str = "\
+803012ff9d4522ff933f1eff933f1effe57f61ff873718ff933f1eff873718ff\
+873718ff933f1effe57f61fff1936efff1936effe57f61ff933f1eff803012ff\
+933f1efff1936efff9a786fff9a786fff9a786fff9a786fff1936eff933f1eff\
+933f1efff9a786fff9a786fff9a786fff9a786fff9a786fff9a786ff933f1eff\
+873718ffffffffff240303fff9a786fff9a786ff240303ffffffffff873718ff\
+f1816efff1816efff9a786fff9a786fff9a786fff9a786fff1816efff1816eff\
+f9a786fff9a786fff9a786ffe57f61ffe57f61fff9a786fff9a786fff9a786ff\
+f1936efff9a786fff9a786fff9a786fff9a786fff9a786fff9a786fff1936eff";
+
+const FACE_EFE: &str = "\
+865c8eff8a6294ff8a6294ff956b9eff8a6294ff8a6294ff784f7eff8a6294ff\
+865c8eff815889ff93699cff815889ff8a6294ff8a6294ff663f69ff8a6294ff\
+8a6294ff815889ffa46840ffab724cff8a6294ff784f7effa46840ff8a6294ff\
+865c8effa46840ffab724cffab724cffab724cffab724cffab724cff815889ff\
+8a6294ffffffffff692b34ffab724cffab724cff692b34ffffffffff8a6294ff\
+956b9effab724cffab724cffab724cffab724cffab724cffab724cff956b9eff\
+956b9effa66849ffab724cff774320ff774320ffab724cffa66849ff9c73a9ff\
+8a6294ffab724cffab724cffab724cffab724cffab724cffab724cff8a6294ff";
+
+const FACE_KAI: &str = "\
+fbed91fffbed91fffbe28afffbed91fffbed91fffbed91fffbed91fffbed91ff\
+fbed91fffbe28afffbed91fffbed91fffbed91ffe8ba6dffe8ba6dfffbed91ff\
+fbed91fffbed91fffbed91fffbed91ffce884effdf9658ffdf9658fffcf4aaff\
+fbed91ffce884effdf9658ffdf9658ffdf9658ffdf9658ffdf9658fffcf4aaff\
+fcf4aaffffffffff436753ffdf9658ffdf9658ff436753fffffffffffcf4aaff\
+fcf4aaffdf9658ffdf9658ffdf9658ffdf9658ffdf9658ffdf9658fffbed91ff\
+fbed91ffdf9658ffdf9658ff774320ff774320ffdf9658ffdf9658fffbed91ff\
+fbed91fffbed91ffdf9658ffdf9658ffdf9658ffdf9658fffbed91fffbed91ff";
+
+const FACE_MAKENA: &str = "\
+261216ff1f0a0eff32191eff32191eff1e0e11ff261216ff32191eff261216ff\
+32191eff261216ff32191eff1f0a0eff443528ff443528ff32191eff32191eff\
+261216ff32191eff38281bff261216ff1f0a0eff443528ff38281bff261216ff\
+38281bff443528ff443528ff443528ff443528ff443528ff443528ff38281bff\
+443528ffd3cbc6ff2e1800ff443528ff443528ff2e1800ffd3cbc6ff443528ff\
+5a4534ff443528ff443528ff443528ff443528ff443528ff443528ff5a4534ff\
+38281bff443528ff443528ff302218ff302218ff443528ff443528ff38281bff\
+2a1e0fff38281bff443528ff443528ff443528ff443528ff38281bff2a1e0fff";
+
+const FACE_NOOR: &str = "\
+2e180eff381e11ff2e180eff593420ff2e180eff381e11ff2e180eff381e11ff\
+381e11ffa75c43ffb9674affa75c43ffb9674affa75c43ffb9674aff381e11ff\
+a75c43ffb9674affcd795bffb9674affb9674affb9674affb9674affa75c43ff\
+b9674affa9563affa9563affb9674affb9674affa9563affa9563affb9674aff\
+a9563affffffffff582c1dffb9674affb9674aff582c1dffffffffffa9563aff\
+b9674affb9674affb9674affb9674affb9674affb9674affb9674affb9674aff\
+a75c43ffb9674affb9674aff733b27ff733b27ffb9674affb9674affa75c43ff\
+914731ffa75c43ffb9674affb9674affb9674affb9674affa75c43ff914731ff";
+
+const FACE_STEVE: &str = "\
 332411ff332411ff3f2a15ff3f2a15ff3f2a15ff3f2a15ff332411ff2b1e0dff\
 241808ff332411ff332411ff3f2a15ff3f2a15ff332411ff3f2a15ff332411ff\
 2b1e0dff9b6349ffb3795effb7836bffb3795effaa7259ff9b6349ff342512ff\
@@ -118,39 +181,190 @@ aa7259ffffffffff523d89ffaa7259ff9b6349ff523d89ffffffffffaa7259ff\
 90593fff8f5e3eff492510ff774235ff774235ff421d0aff8f5e3eff815339ff\
 94603eff815339ff421d0aff492510ff421d0aff492510ff815339ff8f5e3eff";
 
-/// 原版默认皮肤里那张 8×8 的脸（slim，Alex）。
-///
-/// 取值同上，来自 `assets/minecraft/textures/entity/player/wide/alex.png`：
-/// 外层的 `wide/` 与 `slim/` 只有身体模型不同，脸这一块是一样的。
-const ALEX_FACE: &str = "\
-e58d3ffff3a858ffeb983ffff3a858ffe58d3fffeb983ffff3a858ffe58d3ff\
-feb983ffff3a858ffe58d3fffeb983fffe58d3fffe58d3fffeb983ffff3a858ff\
-eb983fffe58d3fffeb983fffe58d3fffdfc4a2ffdfc4a2ffe58d3fffeb983ff\
-feb983fffeb983fffe58d3fffebd0b0ffefdabfffebd0b0ffebd0b0ffe58d3ff\
-febd0b0fffffffff236224ffefdabfffefdabfff236224ffffffffffebd0b0ff\
-efdabfffefdabfffefdabfffefdabfffefdabfffefdabfffefdabfffefdabff\
-fefdabfffefdabfffefdabfffefdabfffefbbb1ffefbbb1ffefdabfffefdabff\
-febd0b0ffebd0b0ffefdabfffefdabfffefdabfffefdabfffefdabfffebd0b0ffdfc4a2ff";
+const FACE_SUNNY: &str = "\
+2f2f2fff383838ff2f2f2fff383838ff494949ff2f2f2fff383838ff2f2f2fff\
+2f2f2fff383838ff494949ff383838ff494949ff2f2f2fff383838ff2f2f2fff\
+2f2f2fff2f2f2fff494949ff2f2f2fff383838ff383838ff2f2f2fff2f2f2fff\
+222222ff2f2f2fff383838ff222222ff2f2f2fff2f2f2fff2f2f2fff222222ff\
+d8844bffffffffff000000ffd8844bffd8844bff000000ffffffffffd8844bff\
+f29f5ffff29f5ffff29f5ffff29f5ffff29f5ffff29f5ffff29f5ffff29f5fff\
+d8844bfff29f5ffff29f5fff774320ff774320fff29f5ffff29f5fffd8844bff\
+c1723fffd8844bfff29f5ffff29f5ffff29f5ffff29f5fffd8844bffc1723fff";
 
-/// 离线账号的头像：原版会按 UUID 在 Steve 与 Alex 之间挑一张。
-///
-/// 说清楚一件事：原版**不会为每个 UUID 生成独一无二的皮肤**，
-/// `DefaultPlayerSkin.getSkinType(uuid)` 只是 `uuid.hashCode() & 1` 决定用哪张默认皮肤。
-/// 所以这里也一样 —— 偶数拿 Steve，奇数拿 Alex。
-pub fn default_head(uuid: &str) -> Vec<u8> {
-    let face = if is_slim(uuid) { ALEX_FACE } else { STEVE_FACE };
-    upscale_face(face)
+const FACE_ZURI: &str = "\
+0e0401ff0e0401ff1b110dff221611ff221611ff1b110dff0e0401ff0e0401ff\
+0e0401ff5f3e29ff6d4830ff7e5337ff7e5337ff6d4830ff5f3e29ff0e0401ff\
+6d4830ff7e5337ff7e5337ff7e5337ff7e5337ff7e5337ff7e5337ff6d4830ff\
+7e5337ff7e5337ff7e5337ff7e5337ff7e5337ff7e5337ff7e5337ff7e5337ff\
+7e5337ffffffffff411e02ff7e5337ff7e5337ff411e02ffffffffff6d4830ff\
+92674cff7e5337ff7e5337ff7e5337ff7e5337ff7e5337ff7e5337ff92674cff\
+7e5337ff7e5337ff7e5337ff753c28ff753c28ff7e5337ff7e5337ff6d4830ff\
+5f3e29ff6d4830ff7e5337ff7e5337ff7e5337ff7e5337ff6d4830ff5f3e29ff";
+
+/// 原版的一张默认皮肤。
+pub struct DefaultSkin {
+    /// 客户端 jar 里的文件名，比如 `steve`、`ari`。
+    pub name: &'static str,
+    /// 这张皮是不是细手臂（`slim`）。
+    pub slim: bool,
+    /// 8×8 的脸，按行写成 RGBA 十六进制。
+    face: &'static str,
+    /// 整张 64×64 的展开图，原样嵌着客户端 jar 里那张 PNG。
+    ///
+    /// 界面要画「完整展开图」时直接用这张；只画头像时用上面那份 8×8
+    /// 就够了，省得为了一格脸去解一整张图。
+    pub png: &'static [u8],
 }
 
-/// 复刻 `java.util.UUID.hashCode()` 的最低位：奇数说明原版会给 Alex。
-fn is_slim(uuid: &str) -> bool {
+/// 原版的默认皮肤表，顺序与客户端 `DefaultPlayerSkin.DEFAULT_SKINS` 逐项对应。
+///
+/// **顺序不能动。** 原版是 `Math.floorMod(uuid.hashCode(), DEFAULT_SKINS.length)`
+/// 取下标，排错一位就会把别人的脸安到这个 UUID 头上。
+pub const DEFAULT_SKINS: [DefaultSkin; 18] = [
+    DefaultSkin {
+        name: "alex",
+        slim: true,
+        face: FACE_ALEX,
+        png: include_bytes!("../assets/skins/slim/alex.png"),
+    },
+    DefaultSkin {
+        name: "ari",
+        slim: true,
+        face: FACE_ARI,
+        png: include_bytes!("../assets/skins/slim/ari.png"),
+    },
+    DefaultSkin {
+        name: "efe",
+        slim: true,
+        face: FACE_EFE,
+        png: include_bytes!("../assets/skins/slim/efe.png"),
+    },
+    DefaultSkin {
+        name: "kai",
+        slim: true,
+        face: FACE_KAI,
+        png: include_bytes!("../assets/skins/slim/kai.png"),
+    },
+    DefaultSkin {
+        name: "makena",
+        slim: true,
+        face: FACE_MAKENA,
+        png: include_bytes!("../assets/skins/slim/makena.png"),
+    },
+    DefaultSkin {
+        name: "noor",
+        slim: true,
+        face: FACE_NOOR,
+        png: include_bytes!("../assets/skins/slim/noor.png"),
+    },
+    DefaultSkin {
+        name: "steve",
+        slim: true,
+        face: FACE_STEVE,
+        png: include_bytes!("../assets/skins/slim/steve.png"),
+    },
+    DefaultSkin {
+        name: "sunny",
+        slim: true,
+        face: FACE_SUNNY,
+        png: include_bytes!("../assets/skins/slim/sunny.png"),
+    },
+    DefaultSkin {
+        name: "zuri",
+        slim: true,
+        face: FACE_ZURI,
+        png: include_bytes!("../assets/skins/slim/zuri.png"),
+    },
+    DefaultSkin {
+        name: "alex",
+        slim: false,
+        face: FACE_ALEX,
+        png: include_bytes!("../assets/skins/wide/alex.png"),
+    },
+    DefaultSkin {
+        name: "ari",
+        slim: false,
+        face: FACE_ARI,
+        png: include_bytes!("../assets/skins/wide/ari.png"),
+    },
+    DefaultSkin {
+        name: "efe",
+        slim: false,
+        face: FACE_EFE,
+        png: include_bytes!("../assets/skins/wide/efe.png"),
+    },
+    DefaultSkin {
+        name: "kai",
+        slim: false,
+        face: FACE_KAI,
+        png: include_bytes!("../assets/skins/wide/kai.png"),
+    },
+    DefaultSkin {
+        name: "makena",
+        slim: false,
+        face: FACE_MAKENA,
+        png: include_bytes!("../assets/skins/wide/makena.png"),
+    },
+    DefaultSkin {
+        name: "noor",
+        slim: false,
+        face: FACE_NOOR,
+        png: include_bytes!("../assets/skins/wide/noor.png"),
+    },
+    DefaultSkin {
+        name: "steve",
+        slim: false,
+        face: FACE_STEVE,
+        png: include_bytes!("../assets/skins/wide/steve.png"),
+    },
+    DefaultSkin {
+        name: "sunny",
+        slim: false,
+        face: FACE_SUNNY,
+        png: include_bytes!("../assets/skins/wide/sunny.png"),
+    },
+    DefaultSkin {
+        name: "zuri",
+        slim: false,
+        face: FACE_ZURI,
+        png: include_bytes!("../assets/skins/wide/zuri.png"),
+    },
+];
+
+/// 原版会给这个 UUID 挑哪一张默认皮肤：`floorMod(hashCode, 18)`。
+///
+/// 说清楚一件事：原版**不会为每个 UUID 生成独一无二的皮肤**，全服就这 18 张，
+/// UUID 只是决定落在哪一张上。
+pub fn default_skin(uuid: &str) -> &'static DefaultSkin {
+    &DEFAULT_SKINS[default_index(uuid)]
+}
+
+/// 离线账号的头像：原版会按 UUID 从 18 张默认皮肤里挑一张，这里也画那一张。
+pub fn default_head(uuid: &str) -> Vec<u8> {
+    upscale_face(default_skin(uuid).face)
+}
+
+/// 原版会给这个 UUID 用哪一张默认皮肤（`alex`、`makena` 这些文件名）。
+pub fn default_skin_name(uuid: &str) -> &'static str {
+    default_skin(uuid).name
+}
+
+/// 这个 UUID 对应的那张默认皮肤整图（64×64 的 PNG 字节）。
+///
+/// 画「完整展开图」用它；只要头像的话用 [`default_head`]，不必解一整张图。
+pub fn default_skin_png(uuid: &str) -> &'static [u8] {
+    default_skin(uuid).png
+}
+
+/// 复刻 `java.util.UUID.hashCode()`，再按原版的 `Math.floorMod` 折到表长上。
+fn default_index(uuid: &str) -> usize {
     match uuid_bits(uuid) {
         Some((most, least)) => {
             let hash = ((most >> 32) ^ most ^ (least >> 32) ^ least) as u32 as i32;
-            hash & 1 != 0
+            hash.rem_euclid(DEFAULT_SKINS.len() as i32) as usize
         }
-        // 认不出来的 UUID 就按 Steve 来：这是大多数皮肤站的默认观感
-        None => false,
+        // 认不出来的 UUID 给第一张：多数皮肤站的默认观感
+        None => 0,
     }
 }
 
@@ -386,6 +600,15 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    /// 把脸那串十六进制的最左上像素解成 RGBA。
+    fn face_pixel(face: &str) -> [u8; 4] {
+        let mut out = [0u8; 4];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&face[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
+    }
+
     /// 造一张假皮肤：背景透明，脸刷成红色，帽子层只盖左上 2×2。
     ///
     /// `legacy` 给出 64×32 的老皮肤（没有帽子层）。真实皮肤里帽子层
@@ -437,51 +660,79 @@ mod tests {
         ihdr.extend_from_slice(&(width as u32).to_be_bytes());
         ihdr.extend_from_slice(&(height as u32).to_be_bytes());
         ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-        push_chunk(&mut out, b"IHDR", &ihdr);
-        push_chunk(&mut out, b"IDAT", &zlib);
-        push_chunk(&mut out, b"IEND", &[]);
+        png::push_chunk(&mut out, b"IHDR", &ihdr);
+        png::push_chunk(&mut out, b"IDAT", &zlib);
+        png::push_chunk(&mut out, b"IEND", &[]);
         out
-    }
-
-    fn push_chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
-        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        out.extend_from_slice(kind);
-        out.extend_from_slice(body);
-        out.extend_from_slice(&[0, 0, 0, 0]); // CRC 校验位，解码器不验
     }
 
     #[test]
     fn a_default_head_is_a_scaled_face() {
+        // Notch 的 UUID 落在表里第 0 张：alex。
         let head = default_head("069a79f444e94726a5befca90e38aaf5");
         assert_eq!(head.len(), HEAD_PX * HEAD_PX * 4);
-        // 左上角那一点就是 Steve 皮肤 (8,8) 的肤色
-        assert_eq!(&head[0..4], &[0x33, 0x24, 0x11, 0xff]);
+        // 左上角那一点就是 alex 那张脸 (8,8) 的肤色
+        assert_eq!(&head[0..4], &[0xe5, 0x8d, 0x3f, 0xff]);
         // 放大是最近邻：相邻两点、上下两行都应该完全一样
         assert_eq!(&head[0..4], &head[4..8]);
         assert_eq!(&head[0..4], &head[(HEAD_PX * 4)..(HEAD_PX * 4 + 4)]);
     }
 
     #[test]
-    fn the_uuid_decides_between_steve_and_alex() {
-        // 这个 UUID 的最低位是 0，原版给 Steve
-        assert!(!is_slim("069a79f444e94726a5befca90e38aaf5"));
+    fn the_uuid_picks_one_of_eighteen_skins() {
+        // 原版是 floorMod(hashCode, 18)，下标对着 DEFAULT_SKINS 走。
+        // 这三个下标是拿 java.util.UUID.hashCode() 的公式手算出来的。
+        assert_eq!(default_skin_name("069a79f444e94726a5befca90e38aaf5"), "alex");
         assert_eq!(
-            &default_head("069a79f444e94726a5befca90e38aaf5")[0..4],
-            &[0x33, 0x24, 0x11, 0xff]
+            default_skin_name("00000000-0000-0000-0000-000000000001"),
+            "ari"
         );
-        // 这个的最低位是 1，原版给 Alex（皮肤偏橙）
-        assert!(is_slim("00000000-0000-0000-0000-000000000001"));
         assert_eq!(
-            &default_head("00000000-0000-0000-0000-000000000001")[0..4],
-            &[0xe5, 0x8d, 0x3f, 0xff]
+            default_skin_name("5627dd98e6be3c21b8a8e92344183641"),
+            "efe"
         );
+        assert_eq!(default_index("00000000-0000-0000-0000-000000000012"), 0);
+
+        // 负数哈希也得折回正的下标里，不能越界
+        for uuid in [
+            "069a79f444e94726a5befca90e38aaf5",
+            "ffffffffffffffffffffffffffffffff",
+            "00000000000000000000000000000001",
+        ] {
+            assert!(default_index(uuid) < DEFAULT_SKINS.len(), "{uuid}");
+        }
+    }
+
+    #[test]
+    fn the_table_has_every_name_in_both_models() {
+        // 9 个名字 × 宽/细两种模型；同名两张的脸必须一模一样，
+        // 因为原版只是换了身体模型，脸是同一张。
+        assert_eq!(DEFAULT_SKINS.len(), 18);
+        for name in [
+            "alex", "ari", "efe", "kai", "makena", "noor", "steve", "sunny", "zuri",
+        ] {
+            let rows: Vec<&DefaultSkin> =
+                DEFAULT_SKINS.iter().filter(|s| s.name == name).collect();
+            assert_eq!(rows.len(), 2, "{name}");
+            assert_eq!(rows[0].face, rows[1].face, "{name} 的两张脸不一样");
+            assert_eq!(rows[0].face.len(), 512, "{name} 的脸不是 8×8");
+            assert!(rows[0].slim != rows[1].slim, "{name} 的模型重复了");
+            // 整图必须是一张能解的 64×64 PNG，而且裁出来的脸和上面那 8×8 一致。
+            for row in [rows[0], rows[1]] {
+                let image = png::decode(row.png).expect("默认皮肤的 PNG 应该能解");
+                assert_eq!((image.width, image.height), (64, 64), "{name}");
+                let head = head_from_skin_png(row.png).expect("默认皮肤能裁出头像");
+                assert_eq!(&head[0..4], &face_pixel(row.face), "{name} 的脸对不上");
+            }
+        }
     }
 
     #[test]
     fn a_broken_uuid_still_gets_a_head() {
         let head = default_head("这不是-uuid");
         assert_eq!(head.len(), HEAD_PX * HEAD_PX * 4);
-        assert_eq!(&head[0..4], &[0x33, 0x24, 0x11, 0xff]);
+        // 认不出来的 UUID 落在第一张：alex
+        assert_eq!(&head[0..4], &[0xe5, 0x8d, 0x3f, 0xff]);
     }
 
     #[test]

@@ -4,18 +4,79 @@
 //! 文件」——`projectID` + `fileID`。要拿到真正能下的 URL，得拿这两个数去查
 //! 一次 API。
 //!
-//! **为什么走镜像**：官方 `api.curseforge.com` 一律要 API key（不带就是 403），
-//! 而 key 不该硬编进一个开源启动器里——那等于替所有人共用一份配额，用光了
-//! 大家都没得玩。`mod.mcimirror.top` 提供的是同一套 v1 接口的无 key 转发，
-//! 字段名、路径、分页格式都对得上。真拿到 key 了换 [`API`] 一个常量就行。
+//! 查的是 `mod.mcimirror.top`：官方 `api.curseforge.com` 不带 API key 一律
+//! 403，而 key 不该硬编进一个开源启动器里——那等于替所有人共用一份配额，
+//! 用光了大家都没得玩。镜像转发的就是同一套 v1 接口（字段名、路径、分页格式
+//! 都对得上），不需要 key，所以这条链路上没有「填 key」这一步。
 //!
-//! 下载地址本身来自 `forgecdn.net`，和 API 无关，所以镜像只承担「查」这一步。
+//! 代价是可用性押在一个第三方服务上：它哪天挂了，CurseForge 整合包就查不到
+//! 下载地址，界面会把「连不上」原样报出来。这是有意为之——留一条要 key 的
+//! 官方后路，等于把「不填就装不了」的麻烦重新塞回给玩家。
+//!
+//! 下载地址本身来自 `forgecdn.net`，和 API 无关，API 只承担「查」这一步。
 
 use crate::json::{self, Json};
 use crate::natives::ZipEntry;
 
-/// CurseForge v1 接口入口（无 key 转发）。
-pub const API: &str = "https://mod.mcimirror.top/curseforge/v1";
+/// CurseForge v1 接口入口（无 key 的镜像转发）。
+pub const MIRROR: &str = "https://mod.mcimirror.top/curseforge/v1";
+
+/// 起步等待时间（秒）。
+///
+/// 实测（2026-11-18）耗时几乎全压在条目数上：`POST /mods/files` 25 个 fileID
+/// 约 1.1 秒、50 个 3.1 秒、100 个 6.1 秒；`POST /mods` 查项目名更慢，每个
+/// 项目约 0.9 秒。所以固定 6 秒会把「接口明明能用、只是包大」误判成超时
+/// ——那正好是最不该放弃的时候。起步 6 秒，再按条目数往上加，见
+/// [`mirror_budget`]。
+pub const MIRROR_TIMEOUT_SECS: u32 = 6;
+
+/// 查文件列表时，每个 fileID 再多给多少毫秒（实测 60 毫秒，留点余量）。
+const MIRROR_FILE_MS: u32 = 80;
+
+/// 查项目名时，每个项目再多给多少毫秒（实测 900 毫秒）。
+const MIRROR_NAME_MS: u32 = 900;
+
+/// 查文件列表最多等多久（秒）。再久就不是「慢」而是「挂了」。
+const MIRROR_FILE_CAP_SECS: u32 = 30;
+
+/// 查项目名最多等多久（秒）。
+///
+/// 这个接口慢得离谱：实测 10 个项目 9.1 秒、100 个 29.4 秒（约每个 0.9 秒）。
+/// 但这一步不只查名字——`classId` 也从这里来，它决定文件落 `mods/` 还是
+/// `resourcepacks/`，省不掉。所以上限给到 45 秒（100 个项目实测 29 秒，
+/// 留一半余量），超了就认输：名字留空、目录按模组算，整合包照样能装完。
+const MIRROR_NAME_CAP_SECS: u32 = 45;
+
+/// 镜像这次最多等多久：起步 6 秒，加上「条目数 × 每条的实测耗时」，封顶。
+fn mirror_budget(items: usize, per_item_ms: u32, cap_secs: u32) -> u32 {
+    let scaled = items as u64 * per_item_ms as u64 / 1000;
+    (MIRROR_TIMEOUT_SECS as u64 + scaled).min(cap_secs as u64) as u32
+}
+
+/// 带正文的 POST。
+///
+/// 用短超时、不重试：卡住了就该把「连不上」报上去，而不是在原地等三次
+/// 60 秒。等多久由调用方按条目数给（见 [`mirror_budget`]）。
+fn post_api(
+    path: &str,
+    body: &str,
+    budget: u32,
+) -> Result<crate::transport::HttpResponse, crate::transport::FetchError> {
+    let url = format!("{}{}", MIRROR, path);
+    crate::transport::post_within(
+        &url,
+        Some("application/json"),
+        &[],
+        body.as_bytes(),
+        budget,
+    )
+}
+
+/// 超时策略同上的 GET。
+fn get_api(path: &str, budget: u32) -> Result<crate::transport::HttpResponse, crate::transport::FetchError> {
+    let url = format!("{}{}", MIRROR, path);
+    crate::transport::get_within(&url, &[], budget)
+}
 
 /// 清单文件名：见到它就是 CurseForge 包。
 pub const CURSEFORGE_MANIFEST: &str = "manifest.json";
@@ -173,7 +234,7 @@ pub struct ResolvedFile {
     pub class_id: u64,
 }
 
-/// 查一批文件。
+/// 查一批文件的下载地址。
 ///
 /// 分两趟：先用 `POST /mods/files` 一次问回全部文件的下载地址（CurseForge
 /// 一次最多认 100 个 fileID），再对没查到的项目用 `POST /mods` 补名字。
@@ -187,13 +248,20 @@ pub fn resolve_files(files: &[ManifestFile]) -> Result<Vec<ResolvedFile>, String
     for chunk in files.chunks(MAX_BATCH) {
         let ids: Vec<String> = chunk.iter().map(|f| f.file_id.to_string()).collect();
         let body = format!(r#"{{"fileIds":[{}]}}"#, ids.join(","));
-        let resp = crate::transport::post_json(&format!("{}/mods/files", API), &body)
-            .map_err(|e| format!("连不上 CurseForge 镜像: {}", e))?;
+        let budget = mirror_budget(chunk.len(), MIRROR_FILE_MS, MIRROR_FILE_CAP_SECS);
+        let resp = post_api("/mods/files", &body, budget)
+            .map_err(|e| format!("连不上 CurseForge：{}", e))?;
 
         // 批量接口对「有一个 id 不存在」的反应是整批 404，而不是少回一条。
         // 一个早就被删掉的老文件就能把整包堵死，所以这里退化成逐个查：
         // 单条查不到只会少一条，其余照常。
+        //
+        // 其余非 2xx（5xx、429）不退化成逐个查——那只会把同一个失败重放
+        // 一百遍。直接报上去。
         if !resp.is_success() {
+            if resp.status != 404 {
+                return Err(format!("CurseForge 返回 {}（查文件列表）", resp.status));
+            }
             for file in chunk {
                 if let Some(found) = resolve_one(file)? {
                     out.push(found);
@@ -240,7 +308,7 @@ pub fn resolve_files(files: &[ManifestFile]) -> Result<Vec<ResolvedFile>, String
     Ok(out)
 }
 
-/// 一次能问多少个 fileID。官方文档写的是 100，镜像沿用。
+/// 一次能问多少个 fileID。官方文档写的是 100。
 const MAX_BATCH: usize = 100;
 
 /// CurseForge 的分类 id → 落盘目录。
@@ -262,9 +330,9 @@ pub fn target_dir(class_id: u64) -> &'static str {
 /// 走 `GET /mods/{project}/files/{file}`：这个接口不存在的 id 会老实回 404，
 /// 而不是像批量接口那样把一整批带下水。
 fn resolve_one(file: &ManifestFile) -> Result<Option<ResolvedFile>, String> {
-    let url = format!("{}/mods/{}/files/{}", API, file.project_id, file.file_id);
-    let resp = crate::transport::get_with_headers(&url, &[])
-        .map_err(|e| format!("连不上 CurseForge 镜像: {}", e))?;
+    let path = format!("/mods/{}/files/{}", file.project_id, file.file_id);
+    let resp =
+        get_api(&path, MIRROR_TIMEOUT_SECS).map_err(|e| format!("连不上 CurseForge：{}", e))?;
     if resp.status == 404 {
         return Ok(None);
     }
@@ -347,7 +415,8 @@ fn fill_names(out: &mut [ResolvedFile], files: &[ManifestFile]) -> Result<(), St
     for chunk in ids.chunks(MAX_BATCH) {
         let list: Vec<String> = chunk.iter().map(|i| i.to_string()).collect();
         let body = format!(r#"{{"modIds":[{}]}}"#, list.join(","));
-        let Ok(resp) = crate::transport::post_json(&format!("{}/mods", API), &body) else {
+        let budget = mirror_budget(chunk.len(), MIRROR_NAME_MS, MIRROR_NAME_CAP_SECS);
+        let Ok(resp) = post_api("/mods", &body, budget) else {
             return Ok(());
         };
         if !resp.is_success() {
@@ -383,11 +452,6 @@ fn fill_names(out: &mut [ResolvedFile], files: &[ManifestFile]) -> Result<(), St
         }
     }
     Ok(())
-}
-
-/// CurseForge 整合包里 `overrides/` 就是实例内容（和 Modrinth 同名同义）。
-pub fn overrides_prefix() -> &'static [&'static str] {
-    &["overrides/"]
 }
 
 /// `overrides/` 之外该忽略的顶层文件（清单本身不进实例目录）。
@@ -465,6 +529,57 @@ mod tests {
         let found = parse_manifest(text).unwrap().unwrap();
         assert_eq!(found.files.len(), 1);
         assert_eq!(found.files[0].project_id, 9);
+    }
+
+    /// 包越大等得越久，但都有上限——别让一个 100 文件的包被 6 秒的固定值判死。
+    #[test]
+    fn a_bigger_batch_gets_a_longer_but_bounded_wait() {
+        // 单个文件的包也至少给满起步时间
+        assert_eq!(mirror_budget(1, MIRROR_FILE_MS, MIRROR_FILE_CAP_SECS), 6);
+        // 100 个 fileID 实测 6.1 秒，给到 6+8=14 秒
+        assert_eq!(mirror_budget(100, MIRROR_FILE_MS, MIRROR_FILE_CAP_SECS), 14);
+        // 但封顶，不能因为包大就一直等
+        assert_eq!(mirror_budget(10_000, MIRROR_FILE_MS, MIRROR_FILE_CAP_SECS), 30);
+        // 查项目名更贵：每个约 0.9 秒，20 个项目给 6+18=24 秒
+        assert_eq!(mirror_budget(20, MIRROR_NAME_MS, MIRROR_NAME_CAP_SECS), 24);
+        // 100 个项目实测 29 秒，直接顶到上限 45 秒
+        assert_eq!(mirror_budget(100, MIRROR_NAME_MS, MIRROR_NAME_CAP_SECS), 45);
+        // 封顶之后不再涨
+        assert_eq!(mirror_budget(1000, MIRROR_NAME_MS, MIRROR_NAME_CAP_SECS), 45);
+    }
+
+    /// 只问镜像这一个口子：地址得是 https，也别再指回官方的域名。
+    #[test]
+    fn the_api_is_the_keyless_mirror() {
+        assert!(MIRROR.starts_with("https://"));
+        assert!(!MIRROR.contains("api.curseforge.com"));
+    }
+
+    /// 作者关了「第三方分发」时 `downloadUrl` 是空的，这时直拼 CDN——
+    /// 拼出来的地址和官方给的一模一样（`edge.forgecdn.net/files/9394/360/…`），
+    /// 镜像返回的也确实是这个格式。
+    #[test]
+    fn a_file_without_distribution_rights_gets_a_predictable_url() {
+        let item = crate::json::parse(
+            r#"{"id": 9394360, "modId": 238222, "fileName": "jei.jar",
+                 "fileLength": 100, "downloadUrl": null}"#,
+        )
+        .expect("应该是 JSON");
+        let found = resolved_from(&item).expect("字段够就该认得出来");
+        assert_eq!(found.filename, "jei.jar");
+        assert_eq!(
+            found.url,
+            "https://edge.forgecdn.net/files/9394/360/jei.jar"
+        );
+    }
+
+    /// 连文件名都没有时拼不出地址，得老实留空。
+    #[test]
+    fn a_file_without_a_name_gets_no_url() {
+        let item = crate::json::parse(r#"{"id": 7, "modId": 8, "downloadUrl": null}"#)
+            .expect("应该是 JSON");
+        let found = resolved_from(&item).expect("id 够就认得出来");
+        assert!(found.url.is_empty(), "不该凭空造一个地址：{}", found.url);
     }
 
     #[test]

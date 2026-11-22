@@ -28,12 +28,7 @@ const H0: [u32; 8] = [
 
 /// 计算一段字节的 SHA-256，返回小写十六进制字符串。
 pub fn sha256_hex(data: &[u8]) -> String {
-    let digest = sha256(data);
-    let mut out = String::with_capacity(64);
-    for b in digest {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
+    crate::hex::to_hex(&sha256(data))
 }
 
 /// 计算一段字节的 SHA-256。
@@ -129,12 +124,7 @@ impl Sha256Stream {
     }
 
     pub fn finish_hex(self) -> String {
-        let digest = self.finish();
-        let mut out = String::with_capacity(64);
-        for b in digest {
-            out.push_str(&format!("{:02x}", b));
-        }
-        out
+        crate::hex::to_hex(&self.finish())
     }
 }
 

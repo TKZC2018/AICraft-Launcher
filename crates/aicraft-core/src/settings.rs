@@ -17,6 +17,29 @@ use crate::json::{self, Json};
 /// 配置文件版本号。字段语义变了才需要加。
 pub const SETTINGS_VERSION: u32 = 1;
 
+/// 拷进数据目录的那张背景图文件名。
+pub const BACKGROUND_FILE: &str = "background.img";
+
+/// 出厂自带的那张壁纸在设置里的名字。
+///
+/// 图本身编在 exe 里（见界面的 wallpaper::DEFAULT_IMAGE），不落在数据目录，
+/// 所以这个名字只是个记号：设置里记着它，就说明玩家用的是出厂壁纸。
+pub const DEFAULT_BACKGROUND_NAME: &str = "默认壁纸";
+
+/// 顶部标题栏与侧边栏底色的默认不透明度（0..=255，255 为完全不透明）。
+///
+/// 这两条都是贴着窗口边的白栏，看上去是一件事，滑杆只给一根。
+/// 出厂默认 80%：底图透上来一层薄雾，栏上的字还站得住。
+pub const DEFAULT_ALPHA_CHROME: u8 = 204;
+/// 中央区域底色的默认不透明度。
+///
+/// 0 就是全透——中间那块只看得见壁纸，卡片和两条白栏负责托住文字。
+pub const DEFAULT_ALPHA_BACKGROUND: u8 = 0;
+/// 卡片底色的默认不透明度。
+///
+/// 跟两条白栏同一档 80%：卡片上压着说明文字，再透下去小字就糊进底图了。
+pub const DEFAULT_ALPHA_CARD: u8 = 204;
+
 /// 下载限速的可设下限（KB/s）。
 ///
 /// 再低就低于 [`crate::speed`] 里每路的下限了，设了也没有意义。
@@ -306,6 +329,212 @@ impl LauncherMode {
     }
 }
 
+
+/// 游戏窗口开多大。
+///
+/// Minecraft 自己只认 `--width/--height/--fullscreen` 三个参数，没有「最大化」
+/// 这一档 —— 所以 [`WindowMode::Maximized`] 是拿屏幕工作区尺寸当窗口尺寸传，
+/// 视觉上等于铺满桌面（不是独占全屏）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowMode {
+    /// 不传尺寸，让游戏自己记住上次开多大。
+    #[default]
+    Auto,
+    /// 按 `window_width` / `window_height` 开。
+    Fixed,
+    /// 铺满桌面可用区域（扣掉任务栏）。
+    Maximized,
+    /// 独占全屏，也就是游戏里按 F11 的那个。
+    Fullscreen,
+}
+
+impl WindowMode {
+    pub const ALL: [WindowMode; 4] = [
+        Self::Auto,
+        Self::Fixed,
+        Self::Maximized,
+        Self::Fullscreen,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            WindowMode::Auto => "auto",
+            WindowMode::Fixed => "fixed",
+            WindowMode::Maximized => "maximized",
+            WindowMode::Fullscreen => "fullscreen",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WindowMode::Auto => "自动",
+            WindowMode::Fixed => "指定宽高",
+            WindowMode::Maximized => "最大化",
+            WindowMode::Fullscreen => "全屏",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<WindowMode> {
+        match id {
+            "auto" => Some(WindowMode::Auto),
+            "fixed" => Some(WindowMode::Fixed),
+            "maximized" => Some(WindowMode::Maximized),
+            "fullscreen" => Some(WindowMode::Fullscreen),
+            _ => None,
+        }
+    }
+}
+
+/// 界面主题色。取 Minecraft 的 16 种染料色，顺序也照染料来。
+///
+/// 这里只存 id 字符串，具体 RGB 交给界面层（`aicraft-ui` 的 `theme`）——
+/// core 不依赖 egui，也没必要知道「品红」到底是哪一号红。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeColor {
+    White,
+    Orange,
+    Magenta,
+    LightBlue,
+    Yellow,
+    #[default]
+    Lime,
+    Pink,
+    Gray,
+    LightGray,
+    Cyan,
+    Purple,
+    Blue,
+    Brown,
+    Green,
+    Red,
+    Black,
+}
+
+impl ThemeColor {
+    /// 黄绿排在最前面：它是默认色，摆在色板第一格才像是「家的位置」。
+    /// 其余十五种仍按染料的习惯顺序跟着。
+    pub const ALL: [ThemeColor; 16] = [
+        Self::Lime,
+        Self::White,
+        Self::Orange,
+        Self::Magenta,
+        Self::LightBlue,
+        Self::Yellow,
+        Self::Pink,
+        Self::Gray,
+        Self::LightGray,
+        Self::Cyan,
+        Self::Purple,
+        Self::Blue,
+        Self::Brown,
+        Self::Green,
+        Self::Red,
+        Self::Black,
+    ];
+
+    /// 存进设置文件的取值。改这些字符串等于让老配置失效，别随手改。
+    pub fn id(self) -> &'static str {
+        match self {
+            ThemeColor::White => "white",
+            ThemeColor::Orange => "orange",
+            ThemeColor::Magenta => "magenta",
+            ThemeColor::LightBlue => "light_blue",
+            ThemeColor::Yellow => "yellow",
+            ThemeColor::Lime => "lime",
+            ThemeColor::Pink => "pink",
+            ThemeColor::Gray => "gray",
+            ThemeColor::LightGray => "light_gray",
+            ThemeColor::Cyan => "cyan",
+            ThemeColor::Purple => "purple",
+            ThemeColor::Blue => "blue",
+            ThemeColor::Brown => "brown",
+            ThemeColor::Green => "green",
+            ThemeColor::Red => "red",
+            ThemeColor::Black => "black",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeColor::White => "白色",
+            ThemeColor::Orange => "橙色",
+            ThemeColor::Magenta => "品红",
+            ThemeColor::LightBlue => "淡蓝",
+            ThemeColor::Yellow => "黄色",
+            ThemeColor::Lime => "黄绿",
+            ThemeColor::Pink => "粉红",
+            ThemeColor::Gray => "灰色",
+            ThemeColor::LightGray => "淡灰",
+            ThemeColor::Cyan => "青色",
+            ThemeColor::Purple => "紫色",
+            ThemeColor::Blue => "蓝色",
+            ThemeColor::Brown => "棕色",
+            ThemeColor::Green => "绿色",
+            ThemeColor::Red => "红色",
+            ThemeColor::Black => "黑色",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<ThemeColor> {
+        match id {
+            "white" => Some(ThemeColor::White),
+            "orange" => Some(ThemeColor::Orange),
+            "magenta" => Some(ThemeColor::Magenta),
+            "light_blue" => Some(ThemeColor::LightBlue),
+            "yellow" => Some(ThemeColor::Yellow),
+            "lime" => Some(ThemeColor::Lime),
+            "pink" => Some(ThemeColor::Pink),
+            "gray" => Some(ThemeColor::Gray),
+            "light_gray" => Some(ThemeColor::LightGray),
+            "cyan" => Some(ThemeColor::Cyan),
+            "purple" => Some(ThemeColor::Purple),
+            "blue" => Some(ThemeColor::Blue),
+            "brown" => Some(ThemeColor::Brown),
+            "green" => Some(ThemeColor::Green),
+            "red" => Some(ThemeColor::Red),
+            "black" => Some(ThemeColor::Black),
+            _ => None,
+        }
+    }
+}
+
+/// 界面各块底色的不透明度。
+///
+/// 三块而不是一个总开关：贴着窗口的两条白栏、中央区、卡片离底图远近不同，
+/// 想「中间透一点、边上稳一点」是很自然的要求，一个滑杆做不到。
+/// 只有摆了背景图时这些值才起作用——没图时各块一律是不透明的原色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiAlphas {
+    /// 顶部标题栏与侧边栏（含账户页左栏）。
+    pub chrome: u8,
+    /// 右侧中央区域的大背景。
+    pub background: u8,
+    /// 每一张卡片。
+    pub card: u8,
+}
+
+impl Default for UiAlphas {
+    fn default() -> Self {
+        UiAlphas {
+            chrome: DEFAULT_ALPHA_CHROME,
+            background: DEFAULT_ALPHA_BACKGROUND,
+            card: DEFAULT_ALPHA_CARD,
+        }
+    }
+}
+
+impl UiAlphas {
+    /// 把一项从 JSON 读出来；缺字段或手改坏了就是 None。
+    ///
+    /// 0 是合法的：全透明也是一档，界面上滑杆能一路拖到底。
+    /// 这里只防手改 JSON 时写出负数或三位数。
+    fn value(json: &Json, key: &str) -> Option<u8> {
+        json.get(key)
+            .and_then(Json::as_i64)
+            .map(|n| n.clamp(0, 255) as u8)
+    }
+}
+
 /// 启动器设置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -337,6 +566,13 @@ pub struct Settings {
     pub jvm_args: String,
     /// 手动指定的 java.exe；None 表示自动挑选。
     pub java_path: Option<PathBuf>,
+    /// 玩家自己「添加 Java 路径」挑进来的那些 java.exe 绝对路径。
+    ///
+    /// 和上面的 `java_path` 是两件事：那个是「现在用哪一个」，这个是
+    /// 「本机还有哪些是我亲手加进来的」。扫描只认 JAVA_HOME / PATH /
+    /// 常见安装目录，装在别处的 JDK 扫不到；不把这些路径记下来，
+    /// 每次重启就得重新挑一遍。
+    pub java_paths: Vec<String>,
     /// 游戏目录（.minecraft 的路径）。
     ///
     /// 空串表示「还没选过」，由界面用默认位置兜底。存成 String 而不是
@@ -364,6 +600,24 @@ pub struct Settings {
     pub isolate_instances: bool,
     /// 游戏跑起来之后启动器怎么处置（关掉再回来 / 只关掉 / 留在后台）。
     pub launcher_mode: LauncherMode,
+    /// 游戏窗口开多大（自动 / 指定宽高 / 铺满桌面）。
+    pub window_mode: WindowMode,
+    /// 指定宽高模式下的窗口宽度（像素）。
+    ///
+    /// 「常用预设」不单独存：选 1920×1080 就是把这两个数改成 1920 / 1080，
+    /// 玩家在界面里看到的是同一份数据，不会出现「预设写着 1080 但实际传了别的」。
+    pub window_width: u32,
+    /// 指定宽高模式下的窗口高度（像素）。
+    pub window_height: u32,
+    /// 启动游戏时把这个 Java 指定成「高性能显卡」。
+    ///
+    /// 双显卡笔记本上，Windows 默认把 `javaw.exe` 派给核显是常有的事，同一份
+    /// 整合包别人 120 帧、自己 40 帧往往就差这一步。开启后启动前会往
+    /// `HKCU\Software\Microsoft\DirectX\UserGpuPreferences` 写一条偏好（见
+    /// [`crate::gpu`]），关掉就撤掉那条。
+    ///
+    /// 默认关闭：这是替玩家改系统里的东西，得他自己点头。
+    pub high_performance_gpu: bool,
     /// 离线用户名。空串表示没设过 —— 界面会显示「未配置」，不替玩家编默认值。
     pub offline_name: String,
     /// 上次选中的游戏版本名。空串表示没选过，启动时挑列表第一个。
@@ -377,9 +631,25 @@ pub struct Settings {
     /// 有人把开了一年多的老服整个文件夹搬过来接着用，那种目录不在
     /// `servers/` 下面，也不归我们管——这里只记路径，删列表项不动磁盘。
     pub server_dirs: Vec<String>,
-    /// 左侧导航是否收起成图标条（只是个界面偏好，但跟着设置一起存）。
-    pub nav_collapsed: bool,
-    pub allow_offline: bool,
+    /// 被玩家从列表里移除掉的服务端目录（绝对路径）。
+    ///
+    /// 「移除」只是让它别再出现在界面上，磁盘一个字节都不动——所以得记住
+    /// 移掉了哪些，否则下次扫描又冒出来。`servers/` 下我们自己装的那些也
+    /// 走这条路：玩家不想看见它，不代表想删掉他的存档。
+    pub hidden_server_dirs: Vec<String>,
+    /// 自定义背景图的**原文件名**，空串表示不要背景图。
+    ///
+    /// 只存名字不存路径：图片本身会被拷进数据目录、固定叫
+    /// `background.img`（见 [`crate::settings::background_path`]），
+    /// 所以原图挪走、删掉都不影响启动器显示它。名字留着只是为了
+    /// 设置页能写出「当前用的是哪张」。
+    pub background_image: String,
+    /// 界面各块底色的不透明度（摆了背景图之后才看得出来）。
+    pub ui_alphas: UiAlphas,
+    /// 切换页面时是否播放淡入过渡（同样是界面偏好，跟着设置一起存）。
+    pub animate_ui: bool,
+    /// 界面主题色（同样是界面偏好）。具体 RGB 由界面层决定，这里只存是哪一种。
+    pub theme_color: ThemeColor,
 }
 
 impl Default for Settings {
@@ -396,16 +666,24 @@ impl Default for Settings {
             min_memory_mb: None,
             jvm_args: String::new(),
             java_path: None,
+            java_paths: Vec::new(),
             game_dir: String::new(),
             game_dirs: Vec::new(),
             hide_official_dir: false,
             isolate_instances: true,
             launcher_mode: LauncherMode::Reopen,
+            window_mode: WindowMode::Auto,
+            window_width: 1280,
+            window_height: 720,
+            high_performance_gpu: false,
             offline_name: String::new(),
             selected_version: String::new(),
             server_dirs: Vec::new(),
-            nav_collapsed: false,
-            allow_offline: false,
+            hidden_server_dirs: Vec::new(),
+            background_image: DEFAULT_BACKGROUND_NAME.to_string(),
+            ui_alphas: UiAlphas::default(),
+            animate_ui: true,
+            theme_color: ThemeColor::Lime,
         }
     }
 }
@@ -425,13 +703,7 @@ impl Settings {
     /// 自动模式下按本机内存现算；本机内存还没探到就先用手动那个值，
     /// 免得在「还没量完」的窗口里给出一个 0。
     pub fn memory_mb(&self) -> u32 {
-        if !self.auto_memory {
-            return self.max_memory_mb;
-        }
-        match crate::meminfo::cached() {
-            Some(memory) => crate::meminfo::recommended_mb(memory.total_mb),
-            None => self.max_memory_mb,
-        }
+        crate::meminfo::effective_mb(self.auto_memory, self.max_memory_mb)
     }
 
     pub fn clamp(&mut self) {
@@ -442,6 +714,10 @@ impl Settings {
             Some(k) => Some(k.clamp(MIN_LIMIT_KBPS, MAX_LIMIT_KBPS)),
         };
         self.max_memory_mb = self.max_memory_mb.clamp(512, 65536);
+        // 窗口尺寸的手输防呆：太小窗口里点不到按钮，太大超过显卡能给的纹理尺寸。
+        // 8192 是各家驱动都认的安全上限。
+        self.window_width = self.window_width.clamp(320, 8192);
+        self.window_height = self.window_height.clamp(240, 8192);
         if let Some(min) = self.min_memory_mb {
             self.min_memory_mb = Some(min.clamp(256, self.max_memory_mb));
         }
@@ -488,6 +764,36 @@ impl Settings {
             servers.push(trimmed.to_string());
         }
         self.server_dirs = servers;
+
+        // 隐藏列表同样去空白、去重。
+        let mut hidden: Vec<String> = Vec::new();
+        for dir in &self.hidden_server_dirs {
+            let trimmed = dir.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if hidden.iter().any(|k| k.eq_ignore_ascii_case(trimmed)) {
+                continue;
+            }
+            hidden.push(trimmed.to_string());
+        }
+        self.hidden_server_dirs = hidden;
+
+        // 手动添加的 Java 路径同理：去空白、去重。Windows 的路径不分大小写，
+        // 比较时统一转小写，免得 `C:\Java` 和 `c:\java` 各占一行。
+        let mut javas: Vec<String> = Vec::new();
+        for path in &self.java_paths {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let key = trimmed.to_lowercase();
+            if javas.iter().any(|k| k.to_lowercase() == key) {
+                continue;
+            }
+            javas.push(trimmed.to_string());
+        }
+        self.java_paths = javas;
     }
 
     /// 序列化成 JSON。
@@ -532,12 +838,28 @@ impl Settings {
             )),
             None => out.push_str("  \"java_path\": null,\n"),
         }
+        out.push_str("  \"java_paths\": [");
+        for (i, path) in self.java_paths.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("\"{}\"", json_escape(path)));
+        }
+        out.push_str("],\n");
         out.push_str(&format!(
             "  \"game_dir\": \"{}\",\n",
             json_escape(&self.game_dir)
         ));
         out.push_str("  \"game_dirs\": [");
         for (i, dir) in self.game_dirs.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("\"{}\"", json_escape(dir)));
+        }
+        out.push_str("],\n");
+        out.push_str("  \"hidden_server_dirs\": [");
+        for (i, dir) in self.hidden_server_dirs.iter().enumerate() {
             if i > 0 {
                 out.push_str(", ");
             }
@@ -557,6 +879,22 @@ impl Settings {
             json_escape(self.launcher_mode.id())
         ));
         out.push_str(&format!(
+            "  \"window_mode\": \"{}\",\n",
+            json_escape(self.window_mode.id())
+        ));
+        out.push_str(&format!(
+            "  \"window_width\": {},\n",
+            self.window_width
+        ));
+        out.push_str(&format!(
+            "  \"window_height\": {},\n",
+            self.window_height
+        ));
+        out.push_str(&format!(
+            "  \"high_performance_gpu\": {},\n",
+            self.high_performance_gpu
+        ));
+        out.push_str(&format!(
             "  \"offline_name\": \"{}\",\n",
             json_escape(&self.offline_name)
         ));
@@ -573,12 +911,25 @@ impl Settings {
         }
         out.push_str("],\n");
         out.push_str(&format!(
-            "  \"nav_collapsed\": {},\n",
-            self.nav_collapsed
+            "  \"background_image\": \"{}\",\n",
+            json_escape(&self.background_image)
         ));
         out.push_str(&format!(
-            "  \"allow_offline\": {}\n",
-            self.allow_offline
+            "  \"alpha_chrome\": {},\n",
+            self.ui_alphas.chrome
+        ));
+        out.push_str(&format!(
+            "  \"alpha_background\": {},\n",
+            self.ui_alphas.background
+        ));
+        out.push_str(&format!(
+            "  \"alpha_card\": {},\n",
+            self.ui_alphas.card
+        ));
+        out.push_str(&format!("  \"animate_ui\": {},\n", self.animate_ui));
+        out.push_str(&format!(
+            "  \"theme_color\": \"{}\"\n",
+            json_escape(self.theme_color.id())
         ));
         out.push_str("}\n");
         out
@@ -638,14 +989,58 @@ impl Settings {
                 s.java_path = Some(PathBuf::from(path));
             }
         }
+        if let Some(items) = root.get("java_paths").and_then(Json::as_array) {
+            s.java_paths = items
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
         if let Some(name) = root.get("selected_version").and_then(Json::as_str) {
             s.selected_version = name.to_string();
         }
-        if let Some(flag) = root.get("nav_collapsed").and_then(Json::as_bool) {
-            s.nav_collapsed = flag;
+        if let Some(name) = root.get("background_image").and_then(Json::as_str) {
+            // 认不出的名字也没什么好校验的：图在不在，等界面真去读时才知道。
+            s.background_image = name.trim().to_string();
+        }
+        // 三块不透明度分开读；旧配置里没有这几个键，就留着默认值。
+        if let Some(v) = UiAlphas::value(&root, "alpha_chrome") {
+            s.ui_alphas.chrome = v;
+        }
+        if let Some(v) = UiAlphas::value(&root, "alpha_background") {
+            s.ui_alphas.background = v;
+        }
+        if let Some(v) = UiAlphas::value(&root, "alpha_card") {
+            s.ui_alphas.card = v;
+        }
+        // 早一版把顶栏与侧栏拆成两根滑杆存过 alpha_titlebar / alpha_sidebar：
+        // 读得回来就取两者里更透的那个，玩家上次调的手感不至于白丢。
+        let titlebar = UiAlphas::value(&root, "alpha_titlebar");
+        let sidebar = UiAlphas::value(&root, "alpha_sidebar");
+        if let Some(v) = titlebar.into_iter().chain(sidebar).min() {
+            s.ui_alphas.chrome = v;
+        }
+        if let Some(flag) = root.get("animate_ui").and_then(Json::as_bool) {
+            s.animate_ui = flag;
+        }
+
+        // 认不出的主题色一律回到默认，别让一个手改坏的字符串把界面染成空白。
+        if let Some(id) = root.get("theme_color").and_then(Json::as_str) {
+            s.theme_color = ThemeColor::from_id(id).unwrap_or_default();
         }
         if let Some(items) = root.get("server_dirs").and_then(Json::as_array) {
             s.server_dirs = items
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Some(items) = root.get("hidden_server_dirs").and_then(Json::as_array) {
+            s.hidden_server_dirs = items
                 .iter()
                 .filter_map(Json::as_str)
                 .map(str::trim)
@@ -675,11 +1070,21 @@ impl Settings {
             // 认不出来的取值就按默认走：宁可多关一次启动器，也别让它赖在后台
             s.launcher_mode = LauncherMode::from_id(id).unwrap_or_default();
         }
+        if let Some(id) = root.get("window_mode").and_then(Json::as_str) {
+            // 认不出来的取值退回「自动」：让游戏自己记，总比给个错尺寸强
+            s.window_mode = WindowMode::from_id(id).unwrap_or_default();
+        }
+        if let Some(flag) = root.get("high_performance_gpu").and_then(Json::as_bool) {
+            s.high_performance_gpu = flag;
+        }
+        if let Some(w) = root.get("window_width").and_then(Json::as_i64) {
+            s.window_width = w as u32;
+        }
+        if let Some(h) = root.get("window_height").and_then(Json::as_i64) {
+            s.window_height = h as u32;
+        }
         if let Some(name) = root.get("offline_name").and_then(Json::as_str) {
             s.offline_name = name.trim().to_string();
-        }
-        if let Some(flag) = root.get("allow_offline").and_then(Json::as_bool) {
-            s.allow_offline = flag;
         }
         // 旧版本存过 "log_level"；现在记录不限等级，读到就忽略（保持兼容）。
         // 也存过 "client_id"；客户端 ID 现在写死在代码里，读到时同样忽略。
@@ -861,6 +1266,16 @@ pub fn is_writable_dir(dir: &Path) -> bool {
 pub fn default_path() -> PathBuf {
     data_dir().join("settings.json")
 }
+
+/// 启动器背景图的实际位置：`<data_dir>/background.img`。
+///
+/// 玩家挑的那张图会被**拷成这个名字**，而不是记住原路径：原图在桌面、
+/// 在下载文件夹、在拔掉的 U 盘里都很正常，记路径的下场是下次启动只剩
+/// 一片纯色底。扩展名也统一成 `.img`——内容照原样存，解码由界面层
+/// 交给 `image` crate，它认头不认扩展名。
+pub fn background_path() -> PathBuf {
+    data_dir().join(BACKGROUND_FILE)
+}
 /// 「让用户自己挑保存位置」的对话框该从哪个目录打开。
 ///
 /// 只要求目录存在，不要求能写 —— 用户在里面往上跳一层就行，真写不进去时
@@ -938,6 +1353,31 @@ mod tests {
         }
     }
 
+    /// 手工加的 Java 路径跟着设置一起存，重复和空白项在读回时清掉。
+    #[test]
+    fn hand_added_java_paths_are_kept_and_deduped() {
+        let mut s = Settings {
+            java_paths: vec![
+                "C:\\Java\\jdk-21\\bin\\javaw.exe".to_string(),
+                "  ".to_string(),
+                "c:\\java\\JDK-21\\bin\\javaw.exe".to_string(),
+                "E:\\Tools\\jdk-17\\bin\\javaw.exe".to_string(),
+            ],
+            ..Settings::default()
+        };
+        s.clamp();
+        assert_eq!(
+            s.java_paths,
+            vec![
+                "C:\\Java\\jdk-21\\bin\\javaw.exe".to_string(),
+                "E:\\Tools\\jdk-17\\bin\\javaw.exe".to_string(),
+            ]
+        );
+        // 写进文件再读回来，一条都不能少
+        let back = Settings::from_json(&s.to_json()).unwrap();
+        assert_eq!(back.java_paths, s.java_paths);
+    }
+
     #[test]
     fn jvm_args_split_on_whitespace() {
         let s = Settings {
@@ -964,16 +1404,28 @@ mod tests {
             min_memory_mb: Some(1024),
             jvm_args: "-Dfoo=\"bar\"\n-XX:+UseG1GC".to_string(),
             java_path: Some(PathBuf::from("C:\\Java\\bin\\java.exe")),
+            java_paths: vec!["C:\\Java\\bin\\javaw.exe".to_string()],
             game_dir: "D:\\Games\\.minecraft".to_string(),
             game_dirs: vec!["E:\\Other\\.minecraft".to_string()],
             hide_official_dir: true,
             isolate_instances: false,
             launcher_mode: LauncherMode::KeepOpen,
+            window_mode: WindowMode::Fixed,
+            window_width: 1920,
+            window_height: 1080,
+            high_performance_gpu: true,
             offline_name: "昔涟".to_string(),
             selected_version: "26.3-Fabric".to_string(),
             server_dirs: vec!["D:\\srv".to_string()],
-            nav_collapsed: true,
-            allow_offline: true,
+            hidden_server_dirs: vec!["D:\\gone".to_string()],
+            background_image: "旅途.png".to_string(),
+            ui_alphas: UiAlphas {
+                chrome: 200,
+                background: 150,
+                card: 240,
+            },
+            animate_ui: false,
+            theme_color: ThemeColor::Cyan,
         };
         let text = s.to_json();
         let back = Settings::from_json(&text).unwrap();
@@ -981,23 +1433,93 @@ mod tests {
         assert_eq!(back.concurrency, 12);
         assert_eq!(back.download_limit_kbps, Some(2048));
         assert_eq!(back.launcher_mode, LauncherMode::KeepOpen);
+        assert_eq!(back.window_mode, WindowMode::Fixed);
+        assert_eq!(back.window_width, 1920);
+        assert_eq!(back.window_height, 1080);
         assert!(!back.auto_memory);
         assert_eq!(back.max_memory_mb, 8192);
         assert_eq!(back.min_memory_mb, Some(1024));
         assert_eq!(back.jvm_args, s.jvm_args);
         assert_eq!(back.java_path, s.java_path);
+        assert_eq!(back.java_paths, s.java_paths);
         assert_eq!(back.game_dir, s.game_dir);
         assert_eq!(back.game_dirs, s.game_dirs);
         assert!(back.hide_official_dir);
         assert!(!back.isolate_instances);
+        assert!(back.high_performance_gpu);
         assert_eq!(back.offline_name, s.offline_name);
         assert_eq!(back.selected_version, "26.3-Fabric");
         assert_eq!(back.server_dirs, vec!["D:\\srv".to_string()]);
-        assert!(back.nav_collapsed);
-        assert!(back.allow_offline);
+        assert_eq!(back.hidden_server_dirs, vec!["D:\\gone".to_string()]);
+        assert_eq!(back.background_image, "旅途.png");
+        assert_eq!(back.ui_alphas, s.ui_alphas);
+        assert!(!back.animate_ui);
+        assert_eq!(back.theme_color, ThemeColor::Cyan);
         assert_eq!(back.fabric_mirror, Mirror::Bmclapi);
         assert_eq!(back.forge_mirror, Mirror::Official);
         assert_eq!(back.neoforge_mirror, Mirror::Bmclapi);
+    }
+
+
+    /// 出厂观感：中央全透让壁纸露出来，两条白栏和卡片各留一层薄雾。
+    ///
+    /// 80% 是滑杆上读作「80%」的那一档（204/255），不是 80/255——按后者算
+    /// 只剩三成不透明，卡片上的小字会糊进底图里。
+    #[test]
+    fn the_ui_alphas_start_light_so_the_wallpaper_shows() {
+        let a = Settings::default().ui_alphas;
+        assert_eq!(a.chrome, 204, "滑杆读数 80%");
+        assert_eq!(a.background, 0, "中间那块直接让壁纸露出来");
+        assert_eq!(a.card, 204, "滑杆读数 80%");
+        assert!(a.chrome < 255 && a.card < 255, "留一层透，底图才看得见");
+        assert!(a.card >= 200, "卡片上要写字，不能透到看不清");
+    }
+
+    /// 0 和 255 都是合法档位：全透、全不透，中间任意一档也不动。
+    #[test]
+    fn the_ui_alphas_keep_the_whole_range() {
+        let s = Settings {
+            ui_alphas: UiAlphas {
+                chrome: 0,
+                background: 255,
+                card: 128,
+            },
+            ..Settings::default()
+        };
+        assert_eq!(s.ui_alphas.chrome, 0, "全透也得能存下来");
+        assert_eq!(s.ui_alphas.background, 255);
+        assert_eq!(s.ui_alphas.card, 128);
+
+        let back = Settings::from_json(&s.to_json()).expect("应当能读回来");
+        assert_eq!(back.ui_alphas, s.ui_alphas);
+    }
+
+    #[test]
+    fn an_old_settings_file_keeps_the_alpha_defaults() {
+        let s = Settings::from_json("{\"animate_ui\": true}").expect("应当能读");
+        assert_eq!(s.ui_alphas, UiAlphas::default());
+    }
+
+    #[test]
+    fn a_hand_written_alpha_is_pulled_into_range() {
+        let s = Settings::from_json(
+            "{\"alpha_chrome\": -20, \"alpha_background\": 900, \"alpha_card\": 120}",
+        )
+        .expect("应当能读");
+        assert_eq!(s.ui_alphas.chrome, 0, "负数收到 0");
+        assert_eq!(s.ui_alphas.background, 255, "三位数收到 255");
+        assert_eq!(s.ui_alphas.card, 120);
+    }
+
+    /// 上一版把顶栏、侧栏存成了两个键：读得回来就合成一根，取更透的那个。
+    #[test]
+    fn the_split_bar_alphas_merge_into_one() {
+        let s = Settings::from_json(
+            "{\"alpha_titlebar\": 210, \"alpha_sidebar\": 190, \"alpha_card\": 240}",
+        )
+        .expect("应当能读");
+        assert_eq!(s.ui_alphas.chrome, 190, "两根合成一根时取更透的");
+        assert_eq!(s.ui_alphas.card, 240);
     }
 
     /// 实例隔离默认是开的：新装的版本各自独立，装两套模组不会互相打架。
@@ -1027,6 +1549,77 @@ mod tests {
         assert_eq!(s.launcher_mode, LauncherMode::Reopen);
         let old = Settings::from_json("{\"concurrency\": 4}").expect("旧文件没有这个键");
         assert_eq!(old.launcher_mode, LauncherMode::Reopen);
+    }
+    /// 默认主题色是黄绿——也就是启动器一直在用的那支薄荷绿。
+    #[test]
+    fn the_theme_starts_out_lime() {
+        assert_eq!(Settings::default().theme_color, ThemeColor::Lime);
+        assert_eq!(ThemeColor::default(), ThemeColor::Lime);
+        assert_eq!(ThemeColor::ALL.len(), 16);
+        assert_eq!(ThemeColor::ALL[0], ThemeColor::Lime, "默认色该排在色板第一格");
+    }
+
+    #[test]
+    fn every_theme_color_round_trips() {
+        for color in ThemeColor::ALL {
+            let s = Settings {
+                theme_color: color,
+                ..Settings::default()
+            };
+            let back = Settings::from_json(&s.to_json()).expect("应当能读回来");
+            assert_eq!(back.theme_color, color, "{} 没有往返成功", color.id());
+        }
+    }
+
+    /// 背景图这一组：默认用出厂那张（图编在 exe 里），存的时候名字里的引号要躲开。
+    #[test]
+    fn the_background_starts_out_as_the_built_in_one() {
+        let s = Settings::default();
+        assert_eq!(s.background_image, DEFAULT_BACKGROUND_NAME);
+        assert_eq!(background_path(), data_dir().join(BACKGROUND_FILE));
+        // 出厂图不进数据目录：它跟着 exe 走，删了重装也还在。
+        let back = Settings::from_json(&s.to_json()).unwrap();
+        assert_eq!(back.background_image, DEFAULT_BACKGROUND_NAME);
+    }
+
+    /// 文件名里有引号和反斜杠也得原样读回来，不然那张图下次就找不到自己了。
+    #[test]
+    fn the_background_name_survives_a_quote() {
+        let s = Settings {
+            background_image: "a\"b\\\\c.png".to_string(),
+            ..Settings::default()
+        };
+        let back = Settings::from_json(&s.to_json()).unwrap();
+        assert_eq!(back.background_image, s.background_image);
+    }
+
+    /// 老配置里没有这个键，读出来就是出厂那张，不该报错。
+    #[test]
+    fn an_old_settings_file_gets_the_built_in_background() {
+        let back = Settings::from_json("{\"concurrency\": 4}").unwrap();
+        assert_eq!(back.background_image, DEFAULT_BACKGROUND_NAME);
+    }
+
+    #[test]
+    fn every_theme_color_has_its_own_name() {
+        let mut ids: Vec<&str> = ThemeColor::ALL.iter().map(|c| c.id()).collect();
+        let mut labels: Vec<&str> = ThemeColor::ALL.iter().map(|c| c.label()).collect();
+        ids.sort_unstable();
+        labels.sort_unstable();
+        let mut unique = ids.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), 16, "有颜色共用了同一个 id");
+        let mut unique_labels = labels.clone();
+        unique_labels.dedup();
+        assert_eq!(unique_labels.len(), 16, "有颜色共用了同一个名字");
+    }
+
+    #[test]
+    fn an_unknown_theme_color_falls_back_to_lime() {
+        let s = Settings::from_json("{\"theme_color\": \"chartreuse\"}").expect("应当能读");
+        assert_eq!(s.theme_color, ThemeColor::Lime);
+        let old = Settings::from_json("{\"concurrency\": 4}").expect("旧文件没有这个键");
+        assert_eq!(old.theme_color, ThemeColor::Lime);
     }
 
     #[test]
@@ -1106,7 +1699,7 @@ mod tests {
     #[test]
     fn old_client_id_key_is_ignored() {
         let old = Settings::from_json(
-            "{\"concurrency\": 4, \"client_id\": \"51306758-f4c5-4577-a122-98ea37ffae0b\"}",
+            "{\"concurrency\": 4, \"client_id\": \"00000000-0000-0000-0000-000000000000\"}",
         )
         .unwrap();
         assert_eq!(old.concurrency, 4);

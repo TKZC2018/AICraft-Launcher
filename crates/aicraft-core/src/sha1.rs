@@ -7,12 +7,7 @@
 
 /// 计算一段字节的 SHA-1，返回小写十六进制字符串。
 pub fn sha1_hex(data: &[u8]) -> String {
-    let digest = sha1(data);
-    let mut out = String::with_capacity(40);
-    for b in digest {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
+    crate::hex::to_hex(&sha1(data))
 }
 
 /// 计算一段字节的 SHA-1。
@@ -164,12 +159,7 @@ impl Sha1Stream {
     }
 
     pub fn finish_hex(self) -> String {
-        let digest = self.finish();
-        let mut out = String::with_capacity(40);
-        for b in digest {
-            out.push_str(&format!("{:02x}", b));
-        }
-        out
+        crate::hex::to_hex(&self.finish())
     }
 
     fn process_block(&mut self, chunk: &[u8]) {

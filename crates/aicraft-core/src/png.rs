@@ -31,6 +31,21 @@ impl Image {
     }
 }
 
+/// 往 `out` 里追加一个 PNG 数据块（长度 + 类型 + 内容 + CRC 占位）。
+///
+/// 只给测试用：皮肤那两处用例都要现造一张合法的 PNG，而造块这件事
+/// 跟解码器是一对 —— 解码器改了，造块的写法也得跟着对，放在同一个文件里
+/// 才不会一边改完另一边忘了。
+///
+/// CRC 一律写 0：这里的解码器不验它，写真的反而要多算一遍。
+#[cfg(test)]
+pub fn push_chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(body);
+    out.extend_from_slice(&[0, 0, 0, 0]);
+}
+
 /// 解码一张 PNG。
 pub fn decode(data: &[u8]) -> Result<Image, String> {
     if data.len() < 8 || &data[..8] != b"\x89PNG\r\n\x1a\n" {

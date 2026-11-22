@@ -166,6 +166,37 @@ pub fn list_files(dir: &Path, extensions: &[&str]) -> Vec<Item> {
     items
 }
 
+/// 列出资源包：`.zip` 文件，以及**带 `pack.mcmeta` 的子目录**。
+///
+/// 游戏两种都认（解压开的文件夹照样能选），但 `resourcepacks/` 里也常躺着
+/// 别的杂项目录，所以目录必须有 `pack.mcmeta` 才算数 —— 判据跟游戏一致。
+pub fn list_packs(dir: &Path) -> Vec<Item> {
+    let mut items = list_files(dir, &["zip"]);
+    items.extend(
+        list_dirs(dir)
+            .into_iter()
+            .filter(|item| item.path.join("pack.mcmeta").is_file()),
+    );
+    sort_items(&mut items);
+    items
+}
+
+/// 列出光影包：`.zip` 文件，以及**带 `shaders/` 子目录的解压包**。
+///
+/// Iris / Oculus 两种都认。这里的判据跟资源包不同：光影包里认的不是
+/// `pack.mcmeta`，而是它自己那套 `shaders/` —— 拿资源包的尺度去量，
+/// 一个都认不出来。
+pub fn list_shaderpacks(dir: &Path) -> Vec<Item> {
+    let mut items = list_files(dir, &["zip"]);
+    items.extend(
+        list_dirs(dir)
+            .into_iter()
+            .filter(|item| item.path.join("shaders").is_dir()),
+    );
+    sort_items(&mut items);
+    items
+}
+
 /// 列出目录里的子目录（存档就是一个目录一个世界）。
 pub fn list_dirs(dir: &Path) -> Vec<Item> {
     let mut items = Vec::new();
@@ -295,6 +326,49 @@ mod tests {
         let tmp = crate::testutil::fresh_dir("inst-missing");
         assert!(list_files(&tmp.join("mods"), &["jar"]).is_empty());
         assert!(list_dirs(&tmp.join("saves")).is_empty());
+        crate::testutil::cleanup(&tmp);
+    }
+
+    #[test]
+    fn packs_include_zips_and_only_the_folders_the_game_would_show() {
+        let tmp = crate::testutil::fresh_dir("inst-packs");
+        let packs = tmp.join("resourcepacks");
+        std::fs::create_dir_all(packs.join("解压开的包")).unwrap();
+        std::fs::write(packs.join("解压开的包").join("pack.mcmeta"), b"{}").unwrap();
+        std::fs::create_dir_all(packs.join("别的杂项")).unwrap();
+        std::fs::write(packs.join("a.zip"), b"1234").unwrap();
+        std::fs::write(packs.join("readme.txt"), b"x").unwrap();
+
+        let items = list_packs(&packs);
+        let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names.len(), 2, "杂项目录和 txt 都不该出现：{:?}", names);
+        assert!(names.contains(&"a.zip"));
+        assert!(names.contains(&"解压开的包"));
+        let zip = items.iter().find(|i| i.name == "a.zip").unwrap();
+        assert_eq!(zip.bytes, 4);
+        assert!(!zip.is_dir);
+        assert!(items.iter().find(|i| i.name == "解压开的包").unwrap().is_dir);
+
+        crate::testutil::cleanup(&tmp);
+    }
+
+    #[test]
+    fn shaderpacks_are_zips_and_folders_with_a_shaders_dir() {
+        // 光影包认的是自己的 `shaders/`，不是资源包那份 `pack.mcmeta`：
+        // 拿资源包的尺度去量，一个都认不出来。
+        let tmp = crate::testutil::fresh_dir("inst-shaders");
+        let dir = tmp.join("shaderpacks");
+        std::fs::create_dir_all(dir.join("解压开的光影").join("shaders")).unwrap();
+        std::fs::create_dir_all(dir.join("不是光影的目录")).unwrap();
+        std::fs::write(dir.join("Complementary.zip"), b"12345").unwrap();
+        std::fs::write(dir.join("说明.txt"), b"x").unwrap();
+
+        let items = list_shaderpacks(&dir);
+        let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names.len(), 2, "杂项目录和 txt 都不该出现：{:?}", names);
+        assert!(names.contains(&"Complementary.zip"));
+        assert!(names.contains(&"解压开的光影"));
+
         crate::testutil::cleanup(&tmp);
     }
 

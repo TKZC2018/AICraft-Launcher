@@ -2,12 +2,12 @@
 
 [package]
 name = "aicraft-ui"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 # 跟 core 不一样：eframe / egui 0.37 自己就要求 1.95，写低了解析依赖时
 # cargo 会直接拒绝构建。core 与 cli 仍然是 1.75（它们零外部依赖）。
 rust-version = "1.95"
-license = "MIT"
+license = "GPL-3.0-or-later"
 description = "AICraft Launcher 的图形界面（egui + eframe）"
 
 [[bin]]
@@ -26,7 +26,11 @@ aicraft-core = { path = "../aicraft-core" }
 # **不开 `default_fonts`**：它会往 exe 里塞四个跨平台的演示字体（约 1.42 MB），
 # 而界面本来就自己从系统读中文字体。字体链改由 `install_fonts()` 手工搭
 # （见 main.rs）：正文取微软雅黑、等宽取 Consolas、符号取 seguisym。
-eframe = { version = "0.37", default-features = false, features = ["glow"] }
+#
+# **要开 `clipboard`**：输入框的右键菜单（剪切/复制/粘贴）和 Ctrl+C/V 都走
+# 系统剪贴板，而 egui-winit 不带这个 feature 时只是把内容写进一个内存字段，
+# 看起来「点了没反应」。它换来 arboard 一个依赖，代价可以接受。
+eframe = { version = "0.37", default-features = false, features = ["glow", "clipboard"] }
 # 同理：`monochrome_emoji_fonts` 会连带 `default_fonts`，
 # emoji 改由系统的 `seguisym.ttf` 兜底（实测覆盖 U+1F50D）。
 egui = { version = "0.37", default-features = false }
@@ -58,3 +62,18 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# core 虽然是路径依赖、不在这个 workspace 里，profile 覆盖依然生效。
+# 理由与根目录那份相同：校验与 JSON 解析是热路径，实测快约 20%，
+# 代价是 exe 大 314 KB。UI 自己的代码继续用 "z"。
+[profile.release.package.aicraft-core]
+opt-level = 2
+
+# 图像解码同理，而且更要紧：JPEG 解码在 opt-level="z" 下慢一倍多，
+# 而它要在启动第一帧之前跑完（背景图）。单独给这几层开 3。
+[profile.release.package.image]
+opt-level = 3
+[profile.release.package.zune-jpeg]
+opt-level = 3
+[profile.release.package.zune-core]
+opt-level = 3

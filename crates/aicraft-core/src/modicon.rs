@@ -142,23 +142,12 @@ fn clean(path: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn entry(name: &str) -> ZipEntry {
-        ZipEntry {
-            name: name.to_string(),
-            compression: 0,
-            compressed_size: 0,
-            uncompressed_size: 0,
-            local_header_offset: 0,
-            is_dir: name.ends_with('/'),
-        }
-    }
-
     #[test]
     fn a_fabric_pack_points_at_one_file() {
         let entries = vec![
-            entry("fabric.mod.json"),
-            entry("assets/icon.png"),
-            entry("META-INF/MANIFEST.MF"),
+            ZipEntry::stub("fabric.mod.json"),
+            ZipEntry::stub("assets/icon.png"),
+            ZipEntry::stub("META-INF/MANIFEST.MF"),
         ];
         let read = |e: &ZipEntry| -> Option<Vec<u8>> {
             if e.name == "fabric.mod.json" {
@@ -175,7 +164,7 @@ mod tests {
 
     #[test]
     fn a_fabric_pack_with_sizes_takes_the_biggest() {
-        let entries = vec![entry("fabric.mod.json")];
+        let entries = vec![ZipEntry::stub("fabric.mod.json")];
         let read = |_: &ZipEntry| -> Option<Vec<u8>> {
             Some(
                 br#"{"icon":{"16":"assets/icon16.png","128":"assets/icon128.png","64":"assets/icon64.png"}}"#
@@ -190,7 +179,7 @@ mod tests {
 
     #[test]
     fn a_forge_mod_declares_a_logo_file() {
-        let entries = vec![entry("META-INF/mods.toml"), entry("logo.png")];
+        let entries = vec![ZipEntry::stub("META-INF/mods.toml"), ZipEntry::stub("logo.png")];
         let read = |_: &ZipEntry| -> Option<Vec<u8>> {
             Some(
                 br#"modLoader="javafml"
@@ -208,10 +197,10 @@ logoFile = "logo.png"
     #[test]
     fn neoforge_wins_over_forge_when_both_are_there() {
         let entries = vec![
-            entry("META-INF/mods.toml"),
-            entry("META-INF/neoforge.mods.toml"),
-            entry("old.png"),
-            entry("new.png"),
+            ZipEntry::stub("META-INF/mods.toml"),
+            ZipEntry::stub("META-INF/neoforge.mods.toml"),
+            ZipEntry::stub("old.png"),
+            ZipEntry::stub("new.png"),
         ];
         let read = |e: &ZipEntry| -> Option<Vec<u8>> {
             match e.name.as_str() {
@@ -225,7 +214,7 @@ logoFile = "logo.png"
 
     #[test]
     fn a_pack_without_any_icon_says_so() {
-        let entries = vec![entry("fabric.mod.json")];
+        let entries = vec![ZipEntry::stub("fabric.mod.json")];
         let read = |_: &ZipEntry| -> Option<Vec<u8>> {
             Some(br#"{"id":"x"}"#.to_vec())
         };
@@ -234,7 +223,7 @@ logoFile = "logo.png"
 
     #[test]
     fn a_broken_manifest_is_not_a_crash() {
-        let entries = vec![entry("fabric.mod.json")];
+        let entries = vec![ZipEntry::stub("fabric.mod.json")];
         let read = |_: &ZipEntry| -> Option<Vec<u8>> { Some(b"{not json".to_vec()) };
         assert_eq!(icon_path(&entries, &read), None);
     }
